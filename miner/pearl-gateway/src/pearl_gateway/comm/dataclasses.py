@@ -2,7 +2,6 @@ import base64
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
-import torch
 from bitcoinutils.transactions import Transaction
 from pearl_gateway.blockchain_utils.blockchain_utils import (
     bits_to_target,
@@ -21,6 +20,8 @@ from pearl_gateway.rpc_types import (
 )
 from pearl_mining import PENALTY_BASE_RANK, IncompleteBlockHeader, penalized_target_bound
 
+UINT256_MAX = (1 << 256) - 1
+
 
 def get_bytes(data: str | bytes) -> bytes:
     if isinstance(data, str):
@@ -36,11 +37,6 @@ def b64_decode(data: str) -> bytes:
     return base64.b64decode(data.encode("ascii"))
 
 
-def decode_dtype(encoded_dtype: str) -> torch.dtype:
-    # dtype is serialized as "torch.dtype"
-    return getattr(torch, encoded_dtype.replace("torch.", ""))
-
-
 @dataclass
 class BlockTemplate:
     """Represents a block template fetched from the Pearl node."""
@@ -51,6 +47,7 @@ class BlockTemplate:
     coinbase_tx: Transaction
     # Certificate version this block must carry under the crossover cutover.
     required_cert_version: CertificateVersion
+    coinbase_value: int = 0
     source_data: GetBlockTemplateResponse | None = field(default=None, repr=False, compare=False)
     mining_address: str | None = field(default=None, repr=False, compare=False)
     worker_id: int = 0
@@ -97,6 +94,7 @@ class BlockTemplate:
             raw_transactions=raw_transactions,
             coinbase_tx=coinbase_tx,
             required_cert_version=CertificateVersion(data.requiredcertversion),
+            coinbase_value=data.coinbasevalue,
             source_data=data,
             mining_address=mining_address,
             worker_id=worker_id,
@@ -142,6 +140,7 @@ class BlockTemplate:
             raw_transactions=self.raw_transactions,
             coinbase_tx=coinbase_tx,
             required_cert_version=self.required_cert_version,
+            coinbase_value=self.coinbase_value,
             source_data=self.source_data,
             mining_address=self.mining_address,
             worker_id=worker_id,
@@ -191,7 +190,7 @@ class MoEBlockInfo:
     top_k: int
     inner_a_rows: list[int]
     inner_b_cols: list[int]
-    routing_data: torch.Tensor  # (m*top_k,) int32, expert-sorted token indices
+    routing_data: Any  # (m*top_k,) int32, expert-sorted token indices
     expert_routing_offsets: list[int]  # routing exclusive end offsets as per ZK verifier
 
 
@@ -199,8 +198,8 @@ class MoEBlockInfo:
 class OpenedBlockInfo:
     A_row_indices: list[int]
     B_column_indices: list[int]
-    A: torch.Tensor | None  # Non-noised matrix A, for PlainProof creation
-    B_t: torch.Tensor | None  # Non-noised matrix B transposed, for PlainProof creation
+    A: Any | None  # Non-noised matrix A, for PlainProof creation
+    B_t: Any | None  # Non-noised matrix B transposed, for PlainProof creation
     commitment_hash: CommitmentHash | None
     noise_rank: int
     moe: MoEBlockInfo | None = None
@@ -233,23 +232,35 @@ class MiningJob:
     target: int
     # Certificate version required for this block.
     cert_version: CertificateVersion
+    expected_reward: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON-RPC response."""
-        return {
+        result = {
             "incomplete_header_bytes": b64_encode(self.incomplete_header_bytes),
             "target": self.target,
+            "target_decimal": str(self.target),
             "cert_version": int(self.cert_version),
         }
+        if self.expected_reward is not None:
+            result["expected_reward"] = self.expected_reward
+        return result
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MiningJob":
         """Create MiningJob from dictionary (JSON-RPC deserialization)."""
 
+        target_value = data.get("target_decimal", data["target"])
+        if isinstance(target_value, bool):
+            raise ValueError("target must be a positive uint256")
+        target = int(target_value)
+        if target <= 0 or target > UINT256_MAX:
+            raise ValueError("target must be a positive uint256")
         return cls(
             incomplete_header_bytes=b64_decode(data["incomplete_header_bytes"]),
-            target=data["target"],
+            target=target,
             cert_version=CertificateVersion(data["cert_version"]),
+            expected_reward=data.get("expected_reward"),
         )
 
     @classmethod
@@ -259,6 +270,7 @@ class MiningJob:
             incomplete_header_bytes=template.header.serialize_without_proof_commitment(),
             target=template.target,
             cert_version=template.required_cert_version,
+            expected_reward=template.coinbase_value,
         )
 
     def adjust_target(self, mining_config: MiningConfiguration) -> int:

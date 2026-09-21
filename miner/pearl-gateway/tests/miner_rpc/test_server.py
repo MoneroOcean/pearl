@@ -394,7 +394,7 @@ class TestMinerRpcServerJsonRpc:
         response = await server._process_request(request_line, mock_client)
 
         assert response["error"]["code"] == -32000
-        assert "Unexpected error" in response["error"]["message"]
+        assert 'Internal error' in response["error"]["message"]
 
 
 @pytest.mark.integration

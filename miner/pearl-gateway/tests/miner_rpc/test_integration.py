@@ -393,7 +393,7 @@ class TestMinerRpcErrorScenarios:
 
             assert status == 200
             assert response["error"]["code"] == -32000
-            assert "Work cache down" in response["error"]["message"]
+            assert 'Internal error' in response["error"]["message"]
 
     async def test_submission_service_failure(
         self, error_test_server, sample_block_template, submit_block_data
@@ -414,7 +414,7 @@ class TestMinerRpcErrorScenarios:
 
             assert status == 200
             assert response["error"]["code"] == -32000
-            assert "Submission failed" in response["error"]["message"]
+            assert 'Internal error' in response["error"]["message"]
 
     async def test_malformed_json_request(self, error_test_server):
         """Test handling of malformed JSON requests."""

@@ -21,8 +21,9 @@ from pearl_gateway.work_cache import WorkCache
 
 logger = get_logger(__name__)
 
-# max proof size should be smaller than this
-READER_BUFFER_LIMIT = 2**20
+# Bounded wire allowance for an 8 MiB decoded proof plus base64/JSON overhead.
+READER_BUFFER_LIMIT = 12 * 1024 * 1024
+CLIENT_READ_TIMEOUT_SECONDS = 65
 
 
 @dataclass
@@ -103,10 +104,10 @@ class MinerRpcServer:
     async def _start_tcp(self):
         """Start the server on a TCP port."""
         self.server = await asyncio.start_server(
-            self._handle_client, "127.0.0.1", self.config.port, limit=READER_BUFFER_LIMIT
+            self._handle_client, self.config.host, self.config.port, limit=READER_BUFFER_LIMIT
         )
 
-        logger.info(f"Miner RPC server listening on TCP: 127.0.0.1:{self.config.port}")
+        logger.info(f"Miner RPC server listening on TCP: {self.config.host}:{self.config.port}")
 
     async def stop(self):
         """Stop the RPC server."""
@@ -142,7 +143,9 @@ class MinerRpcServer:
             while True:
                 try:
                     # Read line-delimited JSON-RPC request
-                    line = await reader.readline()
+                    line = await asyncio.wait_for(
+                        reader.readline(), timeout=CLIENT_READ_TIMEOUT_SECONDS
+                    )
                     if not line:
                         break  # Client disconnected
 
@@ -156,15 +159,25 @@ class MinerRpcServer:
 
                 except asyncio.CancelledError:
                     break
+                except TimeoutError:
+                    logger.warning(f"Client read timeout: {client_id}")
+                    break
+                except ValueError:
+                    # StreamReader raises ValueError when a line exceeds its
+                    # configured limit. Close instead of retrying the same input.
+                    logger.warning(f"Client request exceeds limit: {client_id}")
+                    break
                 except Exception as e:
-                    logger.exception(f"Error processing request from {client_id}: {e}")
-                    response = self._jsonrpc_error(-32000, str(e), request_id=None)
+                    logger.exception(
+                        f"Error processing request from {client_id}: {type(e).__name__}"
+                    )
+                    response = self._jsonrpc_error(-32000, "Internal error", request_id=None)
                     response_line = json.dumps(response) + "\n"
                     writer.write(response_line.encode())
                     await writer.drain()
 
         except Exception as e:
-            logger.exception(f"Client handler error for {client_id}: {e}")
+            logger.exception(f"Client handler error for {client_id}: {type(e).__name__}")
         finally:
             # Clean up client - single point of removal
             self.clients.pop(client_id, None)
@@ -181,8 +194,8 @@ class MinerRpcServer:
         """Validate JSON-RPC params, returning an error response on failure or None on success."""
         try:
             validator(params)
-        except fastjsonschema.exceptions.JsonSchemaException as e:
-            return self._jsonrpc_error(-32602, "Invalid params", request_id, data=str(e))
+        except fastjsonschema.exceptions.JsonSchemaException:
+            return self._jsonrpc_error(-32602, "Invalid params", request_id)
         return None
 
     async def _process_request(self, request_line: str, client: ClientInfo) -> dict[str, Any]:
@@ -194,17 +207,15 @@ class MinerRpcServer:
 
             try:
                 validate_jsonrpc(body)
-            except fastjsonschema.exceptions.JsonSchemaException as e:
+            except fastjsonschema.exceptions.JsonSchemaException:
                 envelope_id = body.get("id") if isinstance(body, dict) else None
-                return self._jsonrpc_error(-32600, "Invalid Request", envelope_id, data=str(e))
+                return self._jsonrpc_error(-32600, "Invalid Request", envelope_id)
 
             method = body["method"]
             params = body.get("params", {})
             request_id = body["id"]
 
             logger.debug(f"Processing request: {method}")
-            logger.trace(f"request params: {params}")
-
             if method == "getMiningInfo":
                 if error := self._validate_params(validate_get_mining_info, params, request_id):
                     return error
@@ -226,13 +237,13 @@ class MinerRpcServer:
             logger.info(f"Mining paused: {e}")
             return self._jsonrpc_error(e.code, str(e), request_id)
 
-        except json.JSONDecodeError as e:
-            logger.warning(f"Invalid JSON in request: {e}")
-            return self._jsonrpc_error(-32700, "Parse error", request_id=None, data=str(e))
+        except json.JSONDecodeError:
+            logger.warning("Invalid JSON in request")
+            return self._jsonrpc_error(-32700, "Parse error", request_id=None)
 
         except Exception as e:
-            logger.exception(f"Error handling RPC request: {e}")
-            return self._jsonrpc_error(-32000, str(e), request_id)
+            logger.exception(f"Error handling RPC request: {type(e).__name__}")
+            return self._jsonrpc_error(-32000, "Internal error", request_id)
 
     async def handle_submit_plain_proof(
         self, plain_proof: PlainProof, mining_job: MiningJob

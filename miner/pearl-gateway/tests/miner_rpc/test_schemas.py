@@ -257,7 +257,7 @@ class TestSubmitPlainProofSchema:
     def test_invalid_header_bytes_format(self, submit_plain_proof_params):
         """Test invalid base64 format in incomplete_header_bytes."""
         invalid_params = submit_plain_proof_params.copy()
-        invalid_params["mining_job"]["incomplete_header_bytes"] = "invalid_base64!"
+        invalid_params["mining_job"]["incomplete_header_bytes"] = "!" * 104
         with pytest.raises(fastjsonschema.JsonSchemaException, match="must match pattern"):
             validate_submit_plain_proof(invalid_params)
 
@@ -274,6 +274,6 @@ class TestSubmitPlainProofSchema:
         invalid_params["mining_job"]["target"] = -1
         with pytest.raises(
             fastjsonschema.JsonSchemaException,
-            match="must be bigger than or equal to 0",
+            match='must be bigger than or equal to 1',
         ):
             validate_submit_plain_proof(invalid_params)

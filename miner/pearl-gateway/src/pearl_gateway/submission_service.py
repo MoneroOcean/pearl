@@ -57,10 +57,14 @@ class SubmissionService:
                 # Submit to the Pearl node
                 self.submitted_blocks += 1
                 result = await self.pearl_client.submit_block(block.serialize().hex())
+                response = {"status": result}
                 # Update counters based on result
                 if result == "accepted":
                     self.accepted_blocks += 1
                     self.submission_log.add(template.header.serialize_without_proof_commitment())
+                    response["block_hash"] = double_sha256(block.header.serialize())[
+                        ::-1
+                    ].hex()
                     logger.info("Block accepted by node!")
                 else:
                     self.rejected_blocks += 1
@@ -72,7 +76,5 @@ class SubmissionService:
                 return {"status": result}
 
             except Exception as e:
-                logger.exception(
-                    f"Error submitting block: {e=}, {type(e)=}, {plain_proof=}, {template=}"
-                )
-                return {"status": f"error: {str(e)}"}
+                logger.exception(f"Error submitting block: {type(e).__name__}")
+                return {"status": "error"}

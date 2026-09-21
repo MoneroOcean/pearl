@@ -21,8 +21,10 @@ class TestMiningJob:
         result = job.to_dict()
         expected_header_bytes = sample_block_template.header.serialize_without_proof_commitment()
 
-        expected_keys = {"incomplete_header_bytes", "target", "cert_version"}
+        expected_keys = {"incomplete_header_bytes", "target", "target_decimal", "cert_version", "expected_reward"}
         assert set(result.keys()) == expected_keys
+        assert result["target_decimal"] == str(sample_block_template.target)
+        assert result["expected_reward"] == sample_block_template.coinbase_value
 
         assert b64_decode(result["incomplete_header_bytes"]) == expected_header_bytes
         assert result["target"] == sample_block_template.target

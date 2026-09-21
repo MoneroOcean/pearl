@@ -45,6 +45,10 @@ class MinerRpcConfig(BaseSettings):
         """Validate configuration after initialization."""
         if self.transport == "tcp" and not self.port:
             raise ValueError("TCP transport requires port to be specified")
+        if self.transport == "tcp" and not self.host:
+            raise ValueError("TCP transport requires host to be specified")
+        if self.transport == "tcp" and not 1 <= self.port <= 65535:
+            raise ValueError("TCP transport port is outside the valid range")
         elif self.transport == "uds" and not self.socket_path:
             raise ValueError("UDS transport requires socket_path")
 

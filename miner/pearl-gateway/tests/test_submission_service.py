@@ -108,7 +108,7 @@ class TestBlockSubmission:
                 sample_plain_proof, sample_block_template
             )
 
-        assert result["status"] == "error: Connection failed"
+        assert result["status"] == 'error'
 
     @pytest.mark.asyncio
     async def test_submit_block_thread_safety(
@@ -252,4 +252,4 @@ class TestSubmissionServiceIntegration:
         assert results[0]["status"] == "accepted"
         assert results[1]["status"] == "rejected: duplicate"
         assert results[2]["status"] == "accepted"
-        assert results[3]["status"].startswith("error:")
+        assert results[3]["status"] == "error"
