@@ -1,5 +1,5 @@
 import base64
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
 import torch
@@ -51,10 +51,13 @@ class BlockTemplate:
     coinbase_tx: Transaction
     # Certificate version this block must carry under the crossover cutover.
     required_cert_version: CertificateVersion
+    source_data: GetBlockTemplateResponse | None = field(default=None, repr=False, compare=False)
+    mining_address: str | None = field(default=None, repr=False, compare=False)
+    worker_id: int = 0
 
     @classmethod
     def from_get_block_template(
-        cls, data: GetBlockTemplateResponse, mining_address: str
+        cls, data: GetBlockTemplateResponse, mining_address: str, worker_id: int = 0
     ) -> "BlockTemplate":
         previousblockhash = data.previousblockhash
         version = data.version
@@ -67,6 +70,7 @@ class BlockTemplate:
             mining_address=mining_address,
             coinbase_aux=data.coinbaseaux.model_dump(),
             default_witness_commitment=data.default_witness_commitment,
+            worker_id=worker_id,
         )
         raw_transactions = [bytes.fromhex(tx.data) for tx in data.transactions]
         txids = [tx.txid for tx in data.transactions]
@@ -93,6 +97,18 @@ class BlockTemplate:
             raw_transactions=raw_transactions,
             coinbase_tx=coinbase_tx,
             required_cert_version=CertificateVersion(data.requiredcertversion),
+            source_data=data,
+            mining_address=mining_address,
+            worker_id=worker_id,
+        )
+
+    def for_worker_id(self, worker_id: int) -> "BlockTemplate":
+        if worker_id == self.worker_id:
+            return self
+        if self.source_data is None or self.mining_address is None:
+            raise ValueError("block template cannot derive worker variants")
+        return type(self).from_get_block_template(
+            self.source_data, self.mining_address, worker_id
         )
 
     def get_raw_transactions(self) -> list[bytes]:

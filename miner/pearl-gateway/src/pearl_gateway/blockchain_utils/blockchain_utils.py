@@ -72,10 +72,18 @@ def create_coinbase_transaction(
     mining_address: str,
     coinbase_aux: dict[str, str] | None = None,
     default_witness_commitment: str | None = None,
+    worker_id: int = 0,
 ) -> Transaction:
     """
     Create a coinbase transaction from scratch.
     """
+    if (
+        isinstance(worker_id, bool)
+        or not isinstance(worker_id, int)
+        or not 0 <= worker_id <= 0xFF
+    ):
+        raise ValueError("worker_id must be an integer from 0 to 255")
+
     script_pubkey = get_script_pubkey_from_p2tr_address(mining_address)
 
     # Build coinbase script (scriptSig)
@@ -84,8 +92,8 @@ def create_coinbase_transaction(
     height_script = Script([height])
     coinbase_script_bytes = bytes.fromhex(height_script.to_hex())
 
-    # Add extra nonce byte (matches node's behavior)
-    coinbase_script_bytes += b"\x00"
+    # Keep one fixed-width byte after the BIP34 height to namespace pool workers.
+    coinbase_script_bytes += bytes([worker_id])
 
     if coinbase_aux and "flags" in coinbase_aux:
         aux_flags = bytes.fromhex(coinbase_aux["flags"])
