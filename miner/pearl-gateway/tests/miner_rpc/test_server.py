@@ -165,13 +165,44 @@ class TestMinerRpcServerHandlers:
         server.work_cache.current_template = sample_block_template
         server.submission_service.submit_plain_proof.return_value = {"status": "accepted"}
 
-        # This is a background task, so it doesn't return a value
-        await server.handle_submit_plain_proof(sample_plain_proof, sample_mining_job)
+        result = await server.handle_submit_plain_proof(sample_plain_proof, sample_mining_job)
 
         # Verify the submission service was called with correct arguments
         server.submission_service.submit_plain_proof.assert_called_once_with(
             sample_plain_proof, sample_block_template
         )
+        assert result == {"status": "accepted"}
+
+    async def test_handle_submit_plain_proof_selects_exact_worker_template(
+        self, server, sample_plain_proof, sample_block_template
+    ):
+        work_cache = WorkCache()
+        await work_cache.update_template(sample_block_template)
+        worker_job = await work_cache.get_mining_job(9)
+        server.work_cache = work_cache
+
+        await server.handle_submit_plain_proof(sample_plain_proof, worker_job)
+
+        submitted_template = server.submission_service.submit_plain_proof.await_args.args[1]
+        assert submitted_template.worker_id == 9
+        assert (
+            submitted_template.header.serialize_without_proof_commitment()
+            == worker_job.incomplete_header_bytes
+        )
+
+    async def test_handle_submit_plain_proof_rejects_expired_header(
+        self, server, sample_plain_proof, sample_block_template
+    ):
+        work_cache = WorkCache()
+        await work_cache.update_template(sample_block_template)
+        old_job = await work_cache.get_mining_job(9)
+        await work_cache.invalidate()
+        server.work_cache = work_cache
+
+        result = await server.handle_submit_plain_proof(sample_plain_proof, old_job)
+
+        server.submission_service.submit_plain_proof.assert_not_awaited()
+        assert result == {"status": "rejected: unknown or expired header"}
 
 
 class TestMinerRpcServerJsonRpc:
@@ -233,7 +264,43 @@ class TestMinerRpcServerJsonRpc:
         assert response["jsonrpc"] == "2.0"
         assert response["id"] == 2
         assert response.get("error") is None
-        assert response["result"] == "submitted"
+        assert response["result"] == {"status": "accepted"}
+        server.submission_service.submit_plain_proof.assert_awaited_once()
+
+    async def test_submit_request_waits_for_submission_service(
+        self,
+        server,
+        sample_block_template,
+        submit_plain_proof_params,
+        mock_client,
+    ):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed_submission(*args):
+            started.set()
+            await release.wait()
+            return {"status": "accepted"}
+
+        server.work_cache.current_template = sample_block_template
+        server.submission_service.submit_plain_proof.side_effect = delayed_submission
+
+        request_line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "submitPlainProof",
+                "params": submit_plain_proof_params,
+                "id": 3,
+            }
+        )
+
+        task = asyncio.create_task(server._process_request(request_line, mock_client))
+        await started.wait()
+        assert not task.done()
+        release.set()
+        response = await task
+
+        assert response["result"] == {"status": "accepted"}
 
     async def test_invalid_json_request(self, server, mock_client):
         """Test handling of invalid JSON."""

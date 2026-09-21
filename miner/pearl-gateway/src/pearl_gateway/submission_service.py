@@ -4,6 +4,7 @@ from typing import Any
 from miner_utils import get_logger
 from pearl_mining import PlainProof, check_cert_version_eligible
 
+from pearl_gateway.blockchain_utils.blockchain_utils import double_sha256
 from pearl_gateway.comm.dataclasses import BlockTemplate
 from pearl_gateway.pearl_client import PearlNodeClient
 from pearl_gateway.proof_generator import ProofGenerator
@@ -51,6 +52,7 @@ class SubmissionService:
                     return {"status": f"error: {e}"}
 
                 block = ProofGenerator.generate_block(plain_proof, template, self.debug_mode)
+                block_hash = double_sha256(block.header.serialize())[::-1].hex()
 
                 # Submit to the Pearl node
                 self.submitted_blocks += 1
@@ -65,6 +67,8 @@ class SubmissionService:
                     logger.warning(f"Block rejected: {result}")
 
                 # Return result to miner
+                if result == "accepted":
+                    return {"status": result, "block_hash": block_hash}
                 return {"status": result}
 
             except Exception as e:

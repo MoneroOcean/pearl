@@ -103,12 +103,48 @@ class BlockTemplate:
         )
 
     def for_worker_id(self, worker_id: int) -> "BlockTemplate":
+        if (
+            isinstance(worker_id, bool)
+            or not isinstance(worker_id, int)
+            or not 0 <= worker_id <= 0xFF
+        ):
+            raise ValueError("worker_id must be an integer from 0 to 255")
         if worker_id == self.worker_id:
             return self
         if self.source_data is None or self.mining_address is None:
             raise ValueError("block template cannot derive worker variants")
-        return type(self).from_get_block_template(
-            self.source_data, self.mining_address, worker_id
+
+        coinbase_tx = create_coinbase_transaction(
+            height=self.source_data.height,
+            coinbase_value=self.source_data.coinbasevalue,
+            mining_address=self.mining_address,
+            coinbase_aux=self.source_data.coinbaseaux.model_dump(),
+            default_witness_commitment=self.source_data.default_witness_commitment,
+            worker_id=worker_id,
+        )
+        merkle_root = calculate_merkle_root(
+            [coinbase_tx.get_txid()] + [tx.txid for tx in self.source_data.transactions]
+        )
+
+        return type(self)(
+            header=PearlHeader(
+                incomplete_header=IncompleteBlockHeader(
+                    version=self.header.version,
+                    prev_block=self.header.previous_block_hash,
+                    merkle_root=merkle_root,
+                    timestamp=self.header.timestamp,
+                    nbits=self.header.target_bits,
+                ),
+            ),
+            height=self.height,
+            # Regular transactions are immutable template data and are shared by every
+            # worker variant; only the coinbase and merkle root vary.
+            raw_transactions=self.raw_transactions,
+            coinbase_tx=coinbase_tx,
+            required_cert_version=self.required_cert_version,
+            source_data=self.source_data,
+            mining_address=self.mining_address,
+            worker_id=worker_id,
         )
 
     def get_raw_transactions(self) -> list[bytes]:

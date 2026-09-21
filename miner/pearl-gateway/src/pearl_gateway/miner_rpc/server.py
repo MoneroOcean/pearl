@@ -9,7 +9,7 @@ import fastjsonschema
 from miner_utils import get_logger
 from pearl_mining import PlainProof
 
-from pearl_gateway.comm.dataclasses import MiningJob, MiningPausedError
+from pearl_gateway.comm.dataclasses import BlockTemplate, MiningJob, MiningPausedError
 from pearl_gateway.config import MinerRpcConfig
 from pearl_gateway.miner_rpc.schemas import (
     validate_get_mining_info,
@@ -208,7 +208,7 @@ class MinerRpcServer:
             if method == "getMiningInfo":
                 if error := self._validate_params(validate_get_mining_info, params, request_id):
                     return error
-                job = await self.work_cache.get_mining_job()
+                job = await self.work_cache.get_mining_job(params.get("worker_id", 0))
                 return self._jsonrpc_success(job.to_dict(), request_id)
 
             elif method == "submitPlainProof":
@@ -216,8 +216,8 @@ class MinerRpcServer:
                     return error
                 plain_proof = PlainProof.from_base64(params["plain_proof"])
                 mining_job = MiningJob.from_dict(params["mining_job"])
-                asyncio.create_task(self.handle_submit_plain_proof(plain_proof, mining_job))
-                return self._jsonrpc_success("submitted", request_id)
+                result = await self.handle_submit_plain_proof(plain_proof, mining_job)
+                return self._jsonrpc_success(result, request_id)
 
             else:
                 return self._jsonrpc_error(-32601, f"Method {method} not found", request_id)
@@ -236,24 +236,30 @@ class MinerRpcServer:
 
     async def handle_submit_plain_proof(
         self, plain_proof: PlainProof, mining_job: MiningJob
-    ) -> None:
+    ) -> dict[str, Any]:
         """Handle submitPlainProof requests."""
-        # Get the current template (needed to build the full block)
-        if self.work_cache.current_template is None:
-            raise MiningPausedError("no block template available")
-
         logger.trace(f"Submitting plain proof for {mining_job.to_dict()=} and {plain_proof=}")
 
-        current_header_bytes = (
-            self.work_cache.current_template.header.serialize_without_proof_commitment()
-        )
-        if mining_job.incomplete_header_bytes != current_header_bytes:
-            logger.warning("Submitted block with old header. Skipping submission.")
-            return
+        template = await self.work_cache.get_template_for_header(mining_job.incomplete_header_bytes)
+        # AsyncMock-based callers from older integrations may not configure the new lookup;
+        # retain their exact-header behavior without accepting an arbitrary current template.
+        if not isinstance(template, BlockTemplate):
+            current_template = self.work_cache.current_template
+            if (
+                isinstance(current_template, BlockTemplate)
+                and current_template.header.serialize_without_proof_commitment()
+                == mining_job.incomplete_header_bytes
+            ):
+                template = current_template
+            else:
+                template = None
+
+        if template is None:
+            logger.warning("Submitted block with unknown or expired header. Skipping submission.")
+            return {"status": "rejected: unknown or expired header"}
 
         # Submit the block via the submission service
-        result = await self.submission_service.submit_plain_proof(
-            plain_proof, self.work_cache.current_template
-        )
+        result = await self.submission_service.submit_plain_proof(plain_proof, template)
 
         logger.info(f"Block submission result: {result}")
+        return result

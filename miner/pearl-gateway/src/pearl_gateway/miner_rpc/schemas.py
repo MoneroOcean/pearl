@@ -17,8 +17,14 @@ JSON_RPC_SCHEMA = {
     "additionalProperties": False,
 }
 
-# Schema for getMiningInfo request (no params required)
-GET_MINING_INFO_SCHEMA = {"type": "object", "additionalProperties": False}
+# Schema for getMiningInfo request.  Empty params keep the worker-0 behavior.
+GET_MINING_INFO_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "worker_id": {"type": "integer", "minimum": 0, "maximum": 255},
+    },
+    "additionalProperties": False,
+}
 
 # Base64 pattern for encoding
 BASE64_PATTERN = "^[A-Za-z0-9+/]*={0,2}$"
@@ -40,6 +46,7 @@ SUBMIT_PLAIN_PROOF_SCHEMA = {
                 "target": {"type": "integer", "minimum": 0},
                 "cert_version": {"type": "integer", "minimum": 1},
             },
+            "additionalProperties": False,
         },
     },
     "additionalProperties": False,

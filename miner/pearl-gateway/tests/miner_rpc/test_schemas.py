@@ -160,6 +160,15 @@ class TestGetMiningInfoSchema:
         ):
             validate_get_mining_info(invalid_params)
 
+    @pytest.mark.parametrize("worker_id", [0, 255])
+    def test_worker_id_boundaries_are_valid(self, worker_id):
+        validate_get_mining_info({"worker_id": worker_id})
+
+    @pytest.mark.parametrize("worker_id", [-1, 256, 1.5, "1", False, True])
+    def test_worker_id_out_of_range_or_wrong_type_is_invalid(self, worker_id):
+        with pytest.raises(fastjsonschema.JsonSchemaException):
+            validate_get_mining_info({"worker_id": worker_id})
+
 
 class TestSubmitPlainProofSchema:
     """Test submitPlainProof method schema validation."""

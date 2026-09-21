@@ -182,3 +182,24 @@ class TestBlockTemplateCertVersion:
         data = {**sample_block_template_data, "requiredcertversion": unknown}
         with pytest.raises(ValidationError):
             GetBlockTemplateResponse.model_validate(data)
+
+
+class TestBlockTemplateWorkerVariants:
+    """Worker namespaces alter only the coinbase-dependent header fields."""
+
+    @pytest.mark.parametrize("worker_id", [-1, 256, False, True])
+    def test_worker_id_boundaries_are_rejected(self, sample_block_template, worker_id):
+        with pytest.raises(ValueError, match="worker_id"):
+            sample_block_template.for_worker_id(worker_id)
+
+    def test_worker_variants_share_regular_transactions(
+        self, sample_block_template
+    ):
+        variant = sample_block_template.for_worker_id(1)
+
+        assert variant.raw_transactions is sample_block_template.raw_transactions
+        assert variant.source_data is sample_block_template.source_data
+        assert variant.worker_id == 1
+        assert variant.header.serialize_without_proof_commitment() != (
+            sample_block_template.header.serialize_without_proof_commitment()
+        )

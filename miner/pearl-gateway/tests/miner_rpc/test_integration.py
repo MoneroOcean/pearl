@@ -111,10 +111,9 @@ class TestMinerRpcIntegrationTcp:
             assert status == 200
             assert response["jsonrpc"] == "2.0"
             assert response.get("error") is None
-            assert response["result"] == "submitted"
+            assert response["result"] == {"status": "accepted"}
 
-        # Verify submission service was called (may take a moment due to background task)
-        await asyncio.sleep(0.1)
+        # Verify submission service was awaited before the response was returned.
         submission_service.submit_plain_proof.assert_called()
 
     async def test_authentication_tcp(self, running_auth_server):
@@ -275,10 +274,9 @@ class TestMinerRpcIntegrationUds:
             assert status == 200
             assert response["jsonrpc"] == "2.0"
             assert response.get("error") is None
-            assert response["result"] == "submitted"
+            assert response["result"] == {"status": "accepted"}
 
             # Verify submission service was called
-            await asyncio.sleep(0.1)
             submission_service.submit_plain_proof.assert_called()
 
 
@@ -412,15 +410,11 @@ class TestMinerRpcErrorScenarios:
         submission_service.submit_plain_proof.side_effect = Exception("Submission failed")
 
         async with MockMinerClient(transport="tcp", port=18449) as client:
-            # submitPlainProof should still return "submitted" (background task)
             status, response = await client.submit_plain_proof(**submit_block_data)
 
             assert status == 200
-            assert response["result"] == "submitted"
-
-            # But the background task should have failed
-            await asyncio.sleep(0.2)  # Wait for background task
-            submission_service.submit_plain_proof.assert_called()
+            assert response["error"]["code"] == -32000
+            assert "Submission failed" in response["error"]["message"]
 
     async def test_malformed_json_request(self, error_test_server):
         """Test handling of malformed JSON requests."""

@@ -169,6 +169,32 @@ class TestMiningJob:
             )
             assert job.target == sample_block_template.target
 
+    @pytest.mark.asyncio
+    async def test_worker_jobs_are_distinct_and_stable(self, work_cache, sample_block_template):
+        await work_cache.update_template(sample_block_template)
+
+        worker_zero = await work_cache.get_mining_job(0)
+        worker_one = await work_cache.get_mining_job(1)
+        worker_one_again = await work_cache.get_mining_job(1)
+        worker_max = await work_cache.get_mining_job(255)
+
+        assert len(worker_zero.incomplete_header_bytes) == 76
+        assert len(worker_one.incomplete_header_bytes) == 76
+        assert len(worker_max.incomplete_header_bytes) == 76
+        assert worker_zero.incomplete_header_bytes != worker_one.incomplete_header_bytes
+        assert worker_one.incomplete_header_bytes == worker_one_again.incomplete_header_bytes
+        assert work_cache.current_template is sample_block_template
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("worker_id", [-1, 256, False, True])
+    async def test_worker_id_boundaries_are_rejected(
+        self, work_cache, sample_block_template, worker_id
+    ):
+        await work_cache.update_template(sample_block_template)
+
+        with pytest.raises(ValueError, match="worker_id"):
+            await work_cache.get_mining_job(worker_id)
+
 
 class TestCacheInvalidation:
     """Test cache invalidation functionality."""
@@ -202,6 +228,22 @@ class TestCacheInvalidation:
 
         with pytest.raises(MiningPausedError, match="no block template available"):
             await work_cache.get_mining_job()
+
+    @pytest.mark.asyncio
+    async def test_parent_change_expires_all_worker_headers(
+        self, work_cache, sample_block_template, different_block_template
+    ):
+        await work_cache.update_template(sample_block_template)
+        old_job = await work_cache.get_mining_job(7)
+        assert (
+            await work_cache.get_template_for_header(old_job.incomplete_header_bytes)
+        ) is not None
+
+        await work_cache.update_template(different_block_template)
+
+        assert (
+            await work_cache.get_template_for_header(old_job.incomplete_header_bytes)
+        ) is None
 
 
 class TestCacheIntegration:

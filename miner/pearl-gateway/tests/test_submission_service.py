@@ -7,6 +7,7 @@ import dataclasses
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pearl_gateway.blockchain_utils.blockchain_utils import double_sha256
 from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.submission_service import SubmissionService
 
@@ -55,7 +56,10 @@ class TestBlockSubmission:
                 sample_plain_proof, sample_block_template
             )
 
-        assert result["status"] == "accepted"
+        expected_hash = double_sha256(sample_pearl_block.header.serialize())[::-1].hex()
+        assert result == {"status": "accepted", "block_hash": expected_hash}
+        assert len(result["block_hash"]) == 64
+        assert result["block_hash"] == result["block_hash"].lower()
 
         mock_pearl_client.submit_block.assert_called_once_with(sample_pearl_block.serialize().hex())
 
@@ -80,6 +84,7 @@ class TestBlockSubmission:
             )
 
         assert result["status"] == "rejected: invalid proof"
+        assert "block_hash" not in result
 
     @pytest.mark.asyncio
     async def test_submit_block_pearl_client_error(
