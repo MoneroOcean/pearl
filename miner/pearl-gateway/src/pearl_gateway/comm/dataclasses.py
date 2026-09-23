@@ -5,6 +5,7 @@ from typing import Any, ClassVar
 from bitcoinutils.transactions import Transaction
 from pearl_gateway.blockchain_utils.blockchain_utils import (
     bits_to_target,
+    calculate_merkle_branch,
     calculate_merkle_root,
     create_coinbase_transaction,
 )
@@ -21,6 +22,9 @@ from pearl_gateway.rpc_types import (
 from pearl_mining import PENALTY_BASE_RANK, IncompleteBlockHeader, penalized_target_bound
 
 UINT256_MAX = (1 << 256) - 1
+INCOMPLETE_HEADER_BYTES = 76
+MAX_WORKER_COINBASE_BYTES = 1024
+MAX_WORKER_MERKLE_BRANCH_BYTES = 1024
 
 
 def get_bytes(data: str | bytes) -> bytes:
@@ -152,6 +156,53 @@ class BlockTemplate:
         coinbase_bytes = self.coinbase_tx.to_bytes(self.coinbase_tx.has_segwit)
         return [coinbase_bytes] + self.raw_transactions
 
+    def get_worker_derivation_recipe(self) -> tuple[bytes, int, bytes]:
+        """Return the bounded worker-coinbase derivation recipe.
+
+        The first item is the worker-0 coinbase serialized without the SegWit
+        marker, flag, and witness.  The second item is the absolute byte offset
+        of the one-byte worker namespace inside that serialization.  The last
+        item concatenates 32-byte internal little-endian Merkle siblings from
+        the coinbase upward; every fold is ``double_sha256(left + sibling)``.
+        """
+        base_template = self if self.worker_id == 0 else self.for_worker_id(0)
+        if base_template.source_data is None:
+            raise ValueError("worker recipe requires a live getblocktemplate source")
+        header_bytes = base_template.header.serialize_without_proof_commitment()
+        if len(header_bytes) != INCOMPLETE_HEADER_BYTES:
+            raise ValueError(
+                "incomplete block header must be exactly "
+                f"{INCOMPLETE_HEADER_BYTES} bytes"
+            )
+
+        coinbase_bytes = base_template.coinbase_tx.to_bytes(False)
+        if not 0 < len(coinbase_bytes) <= MAX_WORKER_COINBASE_BYTES:
+            raise ValueError("worker coinbase serialization is outside its bounded size")
+
+        # Comparing the two endpoint worker values validates that exactly one
+        # serialized byte is mutable, including when the transaction is SegWit.
+        worker_255_bytes = base_template.for_worker_id(255).coinbase_tx.to_bytes(False)
+        if len(worker_255_bytes) != len(coinbase_bytes):
+            raise ValueError("worker coinbase serialization length changed")
+        differing_offsets = [
+            index
+            for index, (base_byte, worker_byte) in enumerate(
+                zip(coinbase_bytes, worker_255_bytes, strict=True)
+            )
+            if base_byte != worker_byte
+        ]
+        if len(differing_offsets) != 1 or coinbase_bytes[differing_offsets[0]] != 0:
+            raise ValueError("worker coinbase must differ at exactly one byte")
+        worker_offset = differing_offsets[0]
+
+        regular_txids = [tx.txid for tx in base_template.source_data.transactions]
+        merkle_branch = calculate_merkle_branch(
+            [base_template.coinbase_tx.get_txid(), *regular_txids]
+        )
+        if len(merkle_branch) > MAX_WORKER_MERKLE_BRANCH_BYTES:
+            raise ValueError("worker Merkle branch is outside its bounded size")
+        return coinbase_bytes, worker_offset, merkle_branch
+
     @property
     def bits(self) -> int:
         return self.header.target_bits
@@ -234,8 +285,11 @@ class MiningJob:
     cert_version: CertificateVersion
     expected_reward: int | None = None
     worker_id: int | None = None
+    worker_coinbase_bytes: bytes | None = field(default=None, repr=False, compare=False)
+    worker_coinbase_offset: int | None = field(default=None, repr=False, compare=False)
+    worker_merkle_branch: bytes | None = field(default=None, repr=False, compare=False)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, include_worker_recipe: bool = False) -> dict[str, Any]:
         """Convert to dictionary for JSON-RPC response."""
         result = {
             "incomplete_header_bytes": b64_encode(self.incomplete_header_bytes),
@@ -247,6 +301,16 @@ class MiningJob:
             result["expected_reward"] = self.expected_reward
         if self.worker_id is not None:
             result["worker_id"] = self.worker_id
+        if include_worker_recipe and self.worker_coinbase_bytes is not None:
+            if self.worker_coinbase_offset is None or self.worker_merkle_branch is None:
+                raise ValueError("worker coinbase recipe is incomplete")
+            result.update(
+                {
+                    "worker_coinbase_bytes": b64_encode(self.worker_coinbase_bytes),
+                    "worker_coinbase_offset": self.worker_coinbase_offset,
+                    "worker_merkle_branch": b64_encode(self.worker_merkle_branch),
+                }
+            )
         return result
 
     @classmethod
@@ -271,8 +335,15 @@ class MiningJob:
         ):
             raise ValueError("worker_id must be an integer from 0 to 255")
 
+        incomplete_header_bytes = b64_decode(data["incomplete_header_bytes"])
+        if len(incomplete_header_bytes) != INCOMPLETE_HEADER_BYTES:
+            raise ValueError(
+                "incomplete block header must be exactly "
+                f"{INCOMPLETE_HEADER_BYTES} bytes"
+            )
+
         return cls(
-            incomplete_header_bytes=b64_decode(data["incomplete_header_bytes"]),
+            incomplete_header_bytes=incomplete_header_bytes,
             target=target,
             cert_version=CertificateVersion(data["cert_version"]),
             expected_reward=data.get("expected_reward"),
@@ -280,14 +351,20 @@ class MiningJob:
         )
 
     @classmethod
-    def from_template(cls, template: BlockTemplate) -> "MiningJob":
+    def from_template(
+        cls, template: BlockTemplate, *, include_worker_recipe: bool = False
+    ) -> "MiningJob":
         """Create MiningJob from BlockTemplate."""
+        worker_recipe = template.get_worker_derivation_recipe() if include_worker_recipe else None
         return cls(
             incomplete_header_bytes=template.header.serialize_without_proof_commitment(),
             target=template.target,
             cert_version=template.required_cert_version,
             expected_reward=template.coinbase_value,
             worker_id=template.worker_id,
+            worker_coinbase_bytes=worker_recipe[0] if worker_recipe else None,
+            worker_coinbase_offset=worker_recipe[1] if worker_recipe else None,
+            worker_merkle_branch=worker_recipe[2] if worker_recipe else None,
         )
 
     def adjust_target(self, mining_config: MiningConfiguration) -> int:

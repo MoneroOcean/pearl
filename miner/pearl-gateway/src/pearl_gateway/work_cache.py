@@ -78,7 +78,9 @@ class WorkCache:
                 logger.debug(f"Template unchanged (age: {age:.2f}s)")
                 return False
 
-    async def get_mining_job(self, worker_id: int = 0) -> MiningJob:
+    async def get_mining_job(
+        self, worker_id: int = 0, *, include_worker_recipe: bool = False
+    ) -> MiningJob:
         """
         Get current mining job for a miner.
         Raises MiningPausedError if no valid template is available.
@@ -89,7 +91,9 @@ class WorkCache:
             except MiningPausedError:
                 logger.warning("No block template available")
                 raise
-            return MiningJob.from_template(template=template)
+            return MiningJob.from_template(
+                template=template, include_worker_recipe=include_worker_recipe
+            )
 
     async def get_template_for_header(
         self, header: bytes, worker_id: int | None = None

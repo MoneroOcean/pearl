@@ -1,4 +1,6 @@
 import pytest
+from bitcoinutils.transactions import Transaction
+from pearl_gateway.blockchain_utils.blockchain_utils import double_sha256
 from pearl_gateway.blockchain_utils.zk_certificate import CertificateVersion
 from pearl_gateway.comm.dataclasses import (
     BlockTemplate,
@@ -84,6 +86,34 @@ class TestMiningJob:
         assert job.target == sample_block_template.target
         assert job.cert_version == sample_block_template.required_cert_version
         assert job.worker_id == sample_block_template.worker_id
+
+    def test_mining_job_worker_recipe_response(self, sample_block_template):
+        job = MiningJob.from_template(sample_block_template, include_worker_recipe=True)
+        data = job.to_dict(include_worker_recipe=True)
+        restored_job = MiningJob.from_dict(data)
+
+        assert {
+            "worker_coinbase_bytes",
+            "worker_coinbase_offset",
+            "worker_merkle_branch",
+        }.issubset(data)
+        assert restored_job.incomplete_header_bytes == job.incomplete_header_bytes
+        assert restored_job.worker_id == job.worker_id
+
+    def test_mining_job_from_dict_rejects_short_header(self, sample_block_template):
+        data = MiningJob.from_template(sample_block_template).to_dict()
+        data["incomplete_header_bytes"] = b64_encode(b"short")
+
+        with pytest.raises(ValueError, match="header must be exactly 76 bytes"):
+            MiningJob.from_dict(data)
+
+    def test_worker_recipe_requires_getblocktemplate_source(
+        self, sample_block_template, monkeypatch
+    ):
+        monkeypatch.setattr(sample_block_template, "source_data", None)
+
+        with pytest.raises(ValueError, match="live getblocktemplate source"):
+            MiningJob.from_template(sample_block_template, include_worker_recipe=True)
 
 
 class TestAdjustTarget:
@@ -216,3 +246,69 @@ class TestBlockTemplateWorkerVariants:
         assert variant.header.serialize_without_proof_commitment() != (
             sample_block_template.header.serialize_without_proof_commitment()
         )
+
+    @pytest.mark.parametrize(
+        "default_witness_commitment", [None, "6a24aa21a9ed" + "00" * 32]
+    )
+    @pytest.mark.parametrize("worker_id", [0, 1, 255])
+    def test_worker_recipe_derives_existing_headers(
+        self,
+        sample_block_template_data,
+        mining_address,
+        default_witness_commitment,
+        worker_id,
+    ):
+        from pearl_gateway.rpc_types import GetBlockTemplateResponse
+
+        template_data = {
+            **sample_block_template_data,
+            "default_witness_commitment": default_witness_commitment,
+        }
+        template = BlockTemplate.from_get_block_template(
+            GetBlockTemplateResponse.model_validate(template_data),
+            mining_address=mining_address,
+        )
+        coinbase_bytes, worker_offset, raw_branch = (
+            template.get_worker_derivation_recipe()
+        )
+
+        assert len(template.header.serialize_without_proof_commitment()) == 76
+        assert 0 <= worker_offset < len(coinbase_bytes)
+        assert coinbase_bytes[worker_offset] == 0
+        assert len(raw_branch) % 32 == 0
+        # The fixture has two regular transactions, so this covers the odd
+        # three-leaf tree and its duplicated final node.
+        assert len(raw_branch) == 64
+
+        derived_coinbase_bytes = bytearray(coinbase_bytes)
+        derived_coinbase_bytes[worker_offset] = worker_id
+        derived_coinbase = Transaction.from_raw(bytes(derived_coinbase_bytes))
+        current_hash = bytes.fromhex(derived_coinbase.get_txid())[::-1]
+        for branch_offset in range(0, len(raw_branch), 32):
+            current_hash = double_sha256(
+                current_hash + raw_branch[branch_offset : branch_offset + 32]
+            )
+        derived_merkle_root = current_hash[::-1]
+
+        variant = template.for_worker_id(worker_id)
+        base_header = template.header.serialize_without_proof_commitment()
+        # Header serialization stores hashes in internal little-endian order.
+        derived_header = base_header[:36] + derived_merkle_root[::-1] + base_header[68:]
+        assert derived_header == variant.header.serialize_without_proof_commitment()
+        assert bytes(derived_coinbase_bytes) == variant.coinbase_tx.to_bytes(False)
+
+        if default_witness_commitment is not None:
+            assert variant.coinbase_tx.to_bytes(True)[4:6] == b"\x00\x01"
+        else:
+            assert variant.coinbase_tx.to_bytes(False)[4:6] != b"\x00\x01"
+
+    def test_worker_recipe_rejects_malformed_header_size(
+        self, sample_block_template, monkeypatch
+    ):
+        monkeypatch.setattr(
+            sample_block_template.header,
+            "serialize_without_proof_commitment",
+            lambda: b"",
+        )
+        with pytest.raises(ValueError, match="header must be exactly 76 bytes"):
+            sample_block_template.get_worker_derivation_recipe()

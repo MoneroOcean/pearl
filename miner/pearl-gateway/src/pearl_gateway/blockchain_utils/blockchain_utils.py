@@ -28,6 +28,41 @@ def calculate_merkle_root(txids: list[str]) -> bytes:
     return _compute_merkle_root(tx_hashes)
 
 
+def calculate_merkle_branch(txids: list[str]) -> bytes:
+    """Return the coinbase-left Merkle branch for ``txids``.
+
+    ``txids`` are display-order (big-endian) hex strings, matching the node's
+    getblocktemplate response.  The returned bytes concatenate one 32-byte
+    sibling per tree level, in low-to-high level order.  Each sibling is the
+    internal little-endian hash byte order used when folding
+    ``double_sha256(left + right)``; the coinbase is always the left operand.
+    An odd level duplicates its final hash using the same rule as
+    :func:`calculate_merkle_root`.
+    """
+    if not txids:
+        raise ValueError("at least one txid is required")
+
+    try:
+        hashes = [bytes.fromhex(txid)[::-1] for txid in txids]
+    except ValueError as exc:
+        raise ValueError("txids must be hexadecimal") from exc
+    if any(len(tx_hash) != 32 for tx_hash in hashes):
+        raise ValueError("txids must be exactly 32 bytes")
+
+    branch: list[bytes] = []
+    while len(hashes) > 1:
+        # The coinbase is at index zero and remains the leftmost node at every
+        # level, so its sibling is the second node in the current level.
+        branch.append(hashes[1])
+        next_level: list[bytes] = []
+        for index in range(0, len(hashes), 2):
+            right = hashes[index + 1] if index + 1 < len(hashes) else hashes[index]
+            next_level.append(double_sha256(hashes[index] + right))
+        hashes = next_level
+
+    return b"".join(branch)
+
+
 def _compute_merkle_root(hashes: list[bytes]) -> bytes:
     """
     Compute merkle root from a list of transaction hashes.

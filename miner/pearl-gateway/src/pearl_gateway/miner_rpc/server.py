@@ -219,8 +219,16 @@ class MinerRpcServer:
             if method == "getMiningInfo":
                 if error := self._validate_params(validate_get_mining_info, params, request_id):
                     return error
-                job = await self.work_cache.get_mining_job(params.get("worker_id", 0))
-                return self._jsonrpc_success(job.to_dict(), request_id)
+                # Keep explicit worker_id requests on the legacy variant path.
+                # An omitted or empty params object opts into the compact
+                # worker-0 recipe response.
+                worker_id = params.get("worker_id", 0)
+                job = await self.work_cache.get_mining_job(
+                    worker_id, include_worker_recipe=not params
+                )
+                return self._jsonrpc_success(
+                    job.to_dict(include_worker_recipe=not params), request_id
+                )
 
             elif method == "submitPlainProof":
                 if error := self._validate_params(validate_submit_plain_proof, params, request_id):

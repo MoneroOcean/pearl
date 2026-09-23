@@ -294,6 +294,62 @@ class TestMinerRpcServerJsonRpc:
         assert response.get("error") is None
         assert "result" in response
 
+    async def test_get_mining_info_returns_base_recipe(
+        self, server, sample_block_template, mock_client
+    ):
+        """Empty params return worker 0 plus the compact derivation recipe."""
+        server.work_cache.get_mining_job.return_value = MiningJob.from_template(
+            sample_block_template, include_worker_recipe=True
+        )
+
+        request_line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "getMiningInfo",
+                "params": {},
+                "id": 1,
+            }
+        )
+
+        response = await server._process_request(request_line, mock_client)
+
+        result = response["result"]
+        assert result["worker_id"] == 0
+        assert {
+            "worker_coinbase_bytes",
+            "worker_coinbase_offset",
+            "worker_merkle_branch",
+        }.issubset(result)
+        server.work_cache.get_mining_job.assert_awaited_once_with(
+            0, include_worker_recipe=True
+        )
+
+    async def test_get_mining_info_preserves_explicit_worker_variant(
+        self, server, sample_block_template, mock_client
+    ):
+        worker_job = MiningJob.from_template(sample_block_template.for_worker_id(255))
+        server.work_cache.get_mining_job.return_value = worker_job
+
+        request_line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "getMiningInfo",
+                "params": {"worker_id": 255},
+                "id": 1,
+            }
+        )
+
+        response = await server._process_request(request_line, mock_client)
+
+        result = response["result"]
+        assert result["worker_id"] == 255
+        assert "worker_coinbase_bytes" not in result
+        assert "worker_coinbase_offset" not in result
+        assert "worker_merkle_branch" not in result
+        server.work_cache.get_mining_job.assert_awaited_once_with(
+            255, include_worker_recipe=False
+        )
+
     async def test_valid_submit_block_request(
         self,
         server,

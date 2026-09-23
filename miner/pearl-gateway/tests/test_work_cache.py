@@ -186,6 +186,23 @@ class TestMiningJob:
         assert work_cache.current_template is sample_block_template
 
     @pytest.mark.asyncio
+    async def test_legacy_worker_zero_skips_recipe_derivation(
+        self, work_cache, sample_block_template, monkeypatch
+    ):
+        await work_cache.update_template(sample_block_template)
+        monkeypatch.setattr(
+            sample_block_template,
+            "get_worker_derivation_recipe",
+            lambda: pytest.fail("legacy worker lookup must not derive a recipe"),
+        )
+
+        job = await work_cache.get_mining_job(0)
+
+        assert job.worker_coinbase_bytes is None
+        assert job.worker_coinbase_offset is None
+        assert job.worker_merkle_branch is None
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("worker_id", [-1, 256, False, True])
     async def test_worker_id_boundaries_are_rejected(
         self, work_cache, sample_block_template, worker_id
