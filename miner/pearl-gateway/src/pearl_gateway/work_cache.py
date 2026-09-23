@@ -91,12 +91,30 @@ class WorkCache:
                 raise
             return MiningJob.from_template(template=template)
 
-    async def get_template_for_header(self, header: bytes) -> BlockTemplate | None:
-        """Return the live template whose incomplete header exactly matches ``header``."""
+    async def get_template_for_header(
+        self, header: bytes, worker_id: int | None = None
+    ) -> BlockTemplate | None:
+        """Return the live template whose incomplete header exactly matches ``header``.
+
+        If the exact header is no longer cached, regenerate only the requested worker
+        variant from the current base template and accept it only when its serialized
+        header is identical to ``header``.
+        """
         if not isinstance(header, bytes) or len(header) != self.INCOMPLETE_HEADER_BYTES:
             return None
         async with self.lock:
-            return self._templates_by_header.get(header)
+            template = self._templates_by_header.get(header)
+            if template is not None or worker_id is None or self.current_template is None:
+                return template
+
+            try:
+                variant = self._get_variant(worker_id)
+            except (MiningPausedError, ValueError):
+                return None
+
+            if variant.header.serialize_without_proof_commitment() != header:
+                return None
+            return variant
 
     async def get_template_age(self) -> float | None:
         """Get the age of the current template in seconds."""

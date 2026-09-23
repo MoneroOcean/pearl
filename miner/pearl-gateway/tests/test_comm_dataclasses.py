@@ -21,7 +21,14 @@ class TestMiningJob:
         result = job.to_dict()
         expected_header_bytes = sample_block_template.header.serialize_without_proof_commitment()
 
-        expected_keys = {"incomplete_header_bytes", "target", "target_decimal", "cert_version", "expected_reward"}
+        expected_keys = {
+            "incomplete_header_bytes",
+            "target",
+            "target_decimal",
+            "cert_version",
+            "expected_reward",
+            "worker_id",
+        }
         assert set(result.keys()) == expected_keys
         assert result["target_decimal"] == str(sample_block_template.target)
         assert result["expected_reward"] == sample_block_template.coinbase_value
@@ -29,6 +36,7 @@ class TestMiningJob:
         assert b64_decode(result["incomplete_header_bytes"]) == expected_header_bytes
         assert result["target"] == sample_block_template.target
         assert result["cert_version"] == int(sample_block_template.required_cert_version)
+        assert result["worker_id"] == sample_block_template.worker_id
 
         # Verify all values are JSON-serializable types
         assert isinstance(result["incomplete_header_bytes"], str)
@@ -49,6 +57,7 @@ class TestMiningJob:
         assert job.incomplete_header_bytes == expected_header_bytes
         assert job.target == data["target"]
         assert job.cert_version == sample_block_template.required_cert_version
+        assert job.worker_id is None
 
     def test_mining_job_round_trip(self, sample_block_template):
         """Test MiningJob to_dict -> from_dict round trip."""
@@ -60,6 +69,7 @@ class TestMiningJob:
         assert restored_job.incomplete_header_bytes == original_job.incomplete_header_bytes
         assert restored_job.target == original_job.target
         assert restored_job.cert_version == original_job.cert_version
+        assert restored_job.worker_id == original_job.worker_id
         # Verify complete equality
         assert restored_job == original_job
 
@@ -73,6 +83,7 @@ class TestMiningJob:
         )
         assert job.target == sample_block_template.target
         assert job.cert_version == sample_block_template.required_cert_version
+        assert job.worker_id == sample_block_template.worker_id
 
 
 class TestAdjustTarget:

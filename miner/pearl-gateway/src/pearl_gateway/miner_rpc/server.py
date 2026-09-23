@@ -251,19 +251,36 @@ class MinerRpcServer:
         """Handle submitPlainProof requests."""
         logger.trace(f"Submitting plain proof for {mining_job.to_dict()=} and {plain_proof=}")
 
-        template = await self.work_cache.get_template_for_header(mining_job.incomplete_header_bytes)
+        if mining_job.worker_id is None:
+            template = await self.work_cache.get_template_for_header(
+                mining_job.incomplete_header_bytes
+            )
+        else:
+            template = await self.work_cache.get_template_for_header(
+                mining_job.incomplete_header_bytes, mining_job.worker_id
+            )
         # AsyncMock-based callers from older integrations may not configure the new lookup;
-        # retain their exact-header behavior without accepting an arbitrary current template.
+        # retain exact-header behavior without accepting an arbitrary current template.
         if not isinstance(template, BlockTemplate):
             current_template = self.work_cache.current_template
-            if (
-                isinstance(current_template, BlockTemplate)
-                and current_template.header.serialize_without_proof_commitment()
-                == mining_job.incomplete_header_bytes
-            ):
-                template = current_template
-            else:
-                template = None
+            template = None
+            if isinstance(current_template, BlockTemplate):
+                if (
+                    current_template.header.serialize_without_proof_commitment()
+                    == mining_job.incomplete_header_bytes
+                ):
+                    template = current_template
+                elif mining_job.worker_id is not None:
+                    try:
+                        variant = current_template.for_worker_id(mining_job.worker_id)
+                    except ValueError:
+                        variant = None
+                    if (
+                        variant is not None
+                        and variant.header.serialize_without_proof_commitment()
+                        == mining_job.incomplete_header_bytes
+                    ):
+                        template = variant
 
         if template is None:
             logger.warning("Submitted block with unknown or expired header. Skipping submission.")

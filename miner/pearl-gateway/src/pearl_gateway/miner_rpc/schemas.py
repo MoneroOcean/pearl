@@ -61,6 +61,7 @@ SUBMIT_PLAIN_PROOF_SCHEMA = {
                 },
                 "cert_version": {"type": "integer", "minimum": 1},
                 "expected_reward": {"type": "integer", "minimum": 0},
+                "worker_id": {"type": "integer", "minimum": 0, "maximum": 255},
             },
             "additionalProperties": False,
         },

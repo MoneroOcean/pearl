@@ -177,6 +177,21 @@ class TestSubmitPlainProofSchema:
         """Test valid submitPlainProof parameters."""
         validate_submit_plain_proof(submit_plain_proof_params)
 
+    @pytest.mark.parametrize("worker_id", [0, 255])
+    def test_worker_id_boundaries_are_valid(self, submit_plain_proof_params, worker_id):
+        params = submit_plain_proof_params.copy()
+        params["mining_job"] = {**params["mining_job"], "worker_id": worker_id}
+
+        validate_submit_plain_proof(params)
+
+    @pytest.mark.parametrize("worker_id", [-1, 256, False, True, "1"])
+    def test_invalid_worker_id_is_rejected(self, submit_plain_proof_params, worker_id):
+        params = submit_plain_proof_params.copy()
+        params["mining_job"] = {**params["mining_job"], "worker_id": worker_id}
+
+        with pytest.raises(fastjsonschema.JsonSchemaException):
+            validate_submit_plain_proof(params)
+
     def test_empty_params_invalid(self):
         """Test empty params for submitPlainProof are invalid."""
         invalid_params = {}

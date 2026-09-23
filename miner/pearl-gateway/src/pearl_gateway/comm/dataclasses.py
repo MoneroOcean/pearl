@@ -233,6 +233,7 @@ class MiningJob:
     # Certificate version required for this block.
     cert_version: CertificateVersion
     expected_reward: int | None = None
+    worker_id: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for JSON-RPC response."""
@@ -244,6 +245,8 @@ class MiningJob:
         }
         if self.expected_reward is not None:
             result["expected_reward"] = self.expected_reward
+        if self.worker_id is not None:
+            result["worker_id"] = self.worker_id
         return result
 
     @classmethod
@@ -256,11 +259,24 @@ class MiningJob:
         target = int(target_value)
         if target <= 0 or target > UINT256_MAX:
             raise ValueError("target must be a positive uint256")
+
+        worker_id = data.get("worker_id")
+        if (
+            worker_id is not None
+            and (
+                isinstance(worker_id, bool)
+                or not isinstance(worker_id, int)
+                or not 0 <= worker_id <= 0xFF
+            )
+        ):
+            raise ValueError("worker_id must be an integer from 0 to 255")
+
         return cls(
             incomplete_header_bytes=b64_decode(data["incomplete_header_bytes"]),
             target=target,
             cert_version=CertificateVersion(data["cert_version"]),
             expected_reward=data.get("expected_reward"),
+            worker_id=worker_id,
         )
 
     @classmethod
@@ -271,6 +287,7 @@ class MiningJob:
             target=template.target,
             cert_version=template.required_cert_version,
             expected_reward=template.coinbase_value,
+            worker_id=template.worker_id,
         )
 
     def adjust_target(self, mining_config: MiningConfiguration) -> int:

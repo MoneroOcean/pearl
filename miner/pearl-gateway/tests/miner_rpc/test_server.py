@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import tempfile
+from dataclasses import replace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -190,6 +191,27 @@ class TestMinerRpcServerHandlers:
             == worker_job.incomplete_header_bytes
         )
 
+    async def test_handle_submit_plain_proof_regenerates_worker_on_cache_miss(
+        self, server, sample_plain_proof, sample_block_template
+    ):
+        work_cache = WorkCache()
+        await work_cache.update_template(sample_block_template)
+        worker_job = await work_cache.get_mining_job(9)
+
+        # A gateway restart retains the current base template but loses variant indexes.
+        work_cache._variants_by_worker_id.clear()
+        work_cache._templates_by_header.clear()
+        server.work_cache = work_cache
+
+        await server.handle_submit_plain_proof(sample_plain_proof, worker_job)
+
+        submitted_template = server.submission_service.submit_plain_proof.await_args.args[1]
+        assert submitted_template.worker_id == worker_job.worker_id == 9
+        assert (
+            submitted_template.header.serialize_without_proof_commitment()
+            == worker_job.incomplete_header_bytes
+        )
+
     async def test_handle_submit_plain_proof_rejects_expired_header(
         self, server, sample_plain_proof, sample_block_template
     ):
@@ -200,6 +222,41 @@ class TestMinerRpcServerHandlers:
         server.work_cache = work_cache
 
         result = await server.handle_submit_plain_proof(sample_plain_proof, old_job)
+
+        server.submission_service.submit_plain_proof.assert_not_awaited()
+        assert result == {"status": "rejected: unknown or expired header"}
+
+    async def test_handle_submit_plain_proof_rejects_regenerated_header_mismatch(
+        self, server, sample_plain_proof, sample_block_template
+    ):
+        work_cache = WorkCache()
+        await work_cache.update_template(sample_block_template)
+        worker_job = await work_cache.get_mining_job(9)
+        mismatched_header = bytes(
+            [worker_job.incomplete_header_bytes[0] ^ 1]
+        ) + worker_job.incomplete_header_bytes[1:]
+        mismatched_job = replace(worker_job, incomplete_header_bytes=mismatched_header)
+
+        work_cache._variants_by_worker_id.clear()
+        work_cache._templates_by_header.clear()
+        server.work_cache = work_cache
+
+        result = await server.handle_submit_plain_proof(sample_plain_proof, mismatched_job)
+
+        server.submission_service.submit_plain_proof.assert_not_awaited()
+        assert result == {"status": "rejected: unknown or expired header"}
+
+    async def test_handle_submit_plain_proof_rejects_mock_lookup_mismatch(
+        self, server, sample_plain_proof, sample_block_template
+    ):
+        server.work_cache.current_template = sample_block_template
+        worker_job = MiningJob.from_template(sample_block_template.for_worker_id(9))
+        mismatched_header = bytes(
+            [worker_job.incomplete_header_bytes[0] ^ 1]
+        ) + worker_job.incomplete_header_bytes[1:]
+        mismatched_job = replace(worker_job, incomplete_header_bytes=mismatched_header)
+
+        result = await server.handle_submit_plain_proof(sample_plain_proof, mismatched_job)
 
         server.submission_service.submit_plain_proof.assert_not_awaited()
         assert result == {"status": "rejected: unknown or expired header"}
