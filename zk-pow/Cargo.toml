@@ -10,6 +10,7 @@ crate-type = ["rlib"]
 [features]
 embedded_cache = [] # embedded verifier cache
 pyo3 = ["dep:pyo3", "pearl-blake3/pyo3"] # Python bindings support
+prover-benchmark = [] # Isolated tuning of verifier-approved prover settings; off by default.
 
 [dependencies]
 serde_json = "1.0"

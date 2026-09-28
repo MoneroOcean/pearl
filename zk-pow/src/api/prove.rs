@@ -16,6 +16,33 @@ pub struct ProveResult {
     pub proof_data: Vec<u8>,
 }
 
+/// Offline benchmark hook, compiled out of normal builds. Both alternatives
+/// are already allowed by the verifier; PoW bits and the security target stay
+/// unchanged, and the existing `num_query_rounds` rule compensates for the rate.
+#[cfg(any(test, feature = "prover-benchmark"))]
+fn benchmark_rate_bits(
+    mut rates: [usize; 3],
+    stark_degree_bits: usize,
+    pow_bits: usize,
+    value: Option<&str>,
+) -> Result<[usize; 3]> {
+    if let Some(value) = value {
+        let rate = value
+            .parse::<usize>()
+            .map_err(|_| anyhow::anyhow!("PEARL_BENCH_STARK_RATE_BITS must be a verifier-approved integer rate"))?;
+        anyhow::ensure!(
+            crate::circuit::pearl_circuit::STAGE_0_PARAMS.contains(&(rate, pow_bits)),
+            "PEARL_BENCH_STARK_RATE_BITS is not approved by the existing verifier"
+        );
+        anyhow::ensure!(
+            stark_degree_bits.checked_add(rate).is_some_and(|bits| bits <= 20),
+            "Benchmark rate exceeds the verifier's maximum expanded STARK degree"
+        );
+        rates[0] = rate;
+    }
+    Ok(rates)
+}
+
 /// Parse a proof (plain or MoE), generate a ZK proof, and return the serialized result.
 pub fn zk_prove_plain_proof(
     block_header: IncompleteBlockHeader,
@@ -54,6 +81,26 @@ pub fn prove_block(
         [1, 3, 7]
     } else {
         [2, 3, 7]
+    };
+    #[cfg(feature = "prover-benchmark")]
+    let default_rate_bits = {
+        let override_value = match std::env::var("PEARL_BENCH_STARK_RATE_BITS") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => return Err(anyhow::anyhow!("Invalid benchmark rate environment: {error}")),
+        };
+        let rates = benchmark_rate_bits(
+            default_rate_bits,
+            compiled_params.degree_bits(),
+            default_pow_bits[0],
+            override_value.as_deref(),
+        )?;
+        log::info!(
+            "Benchmark prover rates: {:?}; PoW bits unchanged: {:?}",
+            rates,
+            default_pow_bits
+        );
+        rates
     };
 
     public_params.hash_jackpot = u32_field_array_to_hash(&stark_pis[pearl_public::HASH_JACKPOT_RANGE].try_into().unwrap());
@@ -109,4 +156,28 @@ pub fn warmup_prove(mining_configuration: MiningConfiguration, cache: &mut Circu
 
     let _ = prove_block(&mut public_params, private_params, cache)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod benchmark_tests {
+    use super::benchmark_rate_bits;
+
+    #[test]
+    fn benchmark_rates_preserve_default_and_other_stages() {
+        assert_eq!(benchmark_rate_bits([1, 3, 7], 15, 18, None).unwrap(), [1, 3, 7]);
+        assert_eq!(benchmark_rate_bits([2, 3, 7], 13, 18, None).unwrap(), [2, 3, 7]);
+        assert_eq!(benchmark_rate_bits([1, 3, 7], 15, 18, Some("2")).unwrap(), [2, 3, 7]);
+        assert_eq!(benchmark_rate_bits([2, 3, 7], 13, 18, Some("1")).unwrap(), [1, 3, 7]);
+    }
+
+    #[test]
+    fn benchmark_rates_reject_unapproved_or_oversized_parameters() {
+        for value in ["0", "3", "64", "-1", "", "2.0", "abc", "18446744073709551615"] {
+            assert!(benchmark_rate_bits([1, 3, 7], 15, 18, Some(value)).is_err());
+        }
+        assert!(benchmark_rate_bits([1, 3, 7], 15, 17, Some("2")).is_err());
+        assert!(benchmark_rate_bits([1, 3, 7], 19, 18, Some("2")).is_err());
+        assert!(benchmark_rate_bits([1, 3, 7], usize::MAX, 18, Some("1")).is_err());
+        assert_eq!(benchmark_rate_bits([1, 3, 7], 18, 18, Some("2")).unwrap(), [2, 3, 7]);
+    }
 }

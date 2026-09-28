@@ -8,6 +8,9 @@ description = "Unified Python bindings for Pearl mining (blake3 merkle trees + Z
 name = "pearl_mining"
 crate-type = ["cdylib"]
 
+[features]
+prover-benchmark = ["zk-pow/prover-benchmark"]
+
 [dependencies]
 pearl-blake3 = { path = "../pearl-blake3", features = ["serde", "pyo3"] }
 zk-pow = { path = "../zk-pow", features = ["pyo3"] }

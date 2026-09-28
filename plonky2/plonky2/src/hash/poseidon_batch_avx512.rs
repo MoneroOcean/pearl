@@ -318,6 +318,38 @@ mod tests {
         }
     }
 
+    #[test]
+    #[ignore = "manual permutation scheduling benchmark"]
+    fn benchmark_permutation_schedules() {
+        use std::hint::black_box;
+        let variants: [(&str, fn([P; SPONGE_WIDTH]) -> [P; SPONGE_WIDTH]); 7] = [
+            ("sequential", permute_sequential),
+            ("groups2", permute_interleaved::<2>),
+            ("groups3", permute_interleaved::<3>),
+            ("groups4", permute_interleaved::<4>),
+            ("groups6", permute_interleaved::<6>),
+            ("groups12", permute_interleaved::<12>),
+            (
+                "sparse",
+                crate::hash::poseidon_batch::packed_poseidon_permutation::<F, P>,
+            ),
+        ];
+        for _ in 0..3 {
+            for (name, kernel) in variants {
+                let mut seed = 0x517c_c1b7_2722_0a95;
+                let mut input = state(&mut seed, 8);
+                let start = std::time::Instant::now();
+                for _ in 0..100000 {
+                    input = kernel(black_box(input));
+                }
+                eprintln!(
+                    "{name}: {:?}, checksum {:?}",
+                    start.elapsed(),
+                    black_box(input[0])
+                );
+            }
+        }
+    }
 
     fn state(seed: &mut u64, case: usize) -> [P; SPONGE_WIDTH] {
         let mut result = [P::ZEROS; SPONGE_WIDTH];
