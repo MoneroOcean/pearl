@@ -12,18 +12,24 @@ use anyhow::Result;
 
 use crate::field::extension::algebra::ExtensionAlgebra;
 use crate::field::extension::{Extendable, FieldExtension};
+use crate::field::packed::PackedField;
 use crate::field::types::Field;
 use crate::gates::gate::Gate;
+use crate::gates::packed_util::PackedEvaluableBase;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
 use crate::hash::poseidon::{Poseidon, SPONGE_WIDTH};
+use crate::hash::poseidon_batch::packed_mds_layer;
 use crate::iop::ext_target::{ExtensionAlgebraTarget, ExtensionTarget};
 use crate::iop::generator::{GeneratedValues, SimpleGenerator, WitnessGeneratorRef};
 use crate::iop::target::Target;
 use crate::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use crate::plonk::circuit_builder::CircuitBuilder;
 use crate::plonk::circuit_data::CommonCircuitData;
-use crate::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBase};
+use crate::plonk::vars::{
+    EvaluationTargets, EvaluationVars, EvaluationVarsBase, EvaluationVarsBaseBatch,
+    EvaluationVarsBasePacked,
+};
 use crate::util::serialization::{Buffer, IoResult, Read, Write};
 
 /// Poseidon MDS Gate
@@ -174,6 +180,10 @@ impl<F: RichField + Extendable<D> + Poseidon, const D: usize> Gate<F, D> for Pos
         )
     }
 
+    fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
+        self.eval_unfiltered_base_batch_packed(vars_base)
+    }
+
     fn eval_unfiltered_circuit(
         &self,
         builder: &mut CircuitBuilder<F, D>,
@@ -217,6 +227,35 @@ impl<F: RichField + Extendable<D> + Poseidon, const D: usize> Gate<F, D> for Pos
 
     fn num_constraints(&self) -> usize {
         SPONGE_WIDTH * D
+    }
+}
+
+impl<F: RichField + Extendable<D> + Poseidon, const D: usize> PackedEvaluableBase<F, D>
+    for PoseidonMdsGate<F, D>
+{
+    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>>(
+        &self,
+        vars: EvaluationVarsBasePacked<P>,
+        mut yield_constr: StridedConstraintConsumer<P>,
+    ) {
+        // MDS is linear over the base field, so evaluate each extension coordinate as an
+        // independent packed base-field state. The scalar evaluator emits output-major,
+        // dimension-minor constraints; retain that exact order below.
+        let mut computed_outputs = [[P::ZEROS; D]; SPONGE_WIDTH];
+        for d in 0..D {
+            let inputs = core::array::from_fn(|i| vars.local_wires[i * D + d]);
+            let computed = packed_mds_layer::<F, P>(&inputs);
+            for i in 0..SPONGE_WIDTH {
+                computed_outputs[i][d] = computed[i];
+            }
+        }
+
+        for i in 0..SPONGE_WIDTH {
+            for d in 0..D {
+                let output = vars.local_wires[(SPONGE_WIDTH + i) * D + d];
+                yield_constr.one(output - computed_outputs[i][d]);
+            }
+        }
     }
 }
 
@@ -279,9 +318,19 @@ impl<F: RichField + Extendable<D> + Poseidon, const D: usize> SimpleGenerator<F,
 
 #[cfg(test)]
 mod tests {
+    use plonky2_field::goldilocks_field::GoldilocksField;
+    use plonky2_field::packable::Packable;
+    use plonky2_field::packed::PackedField;
+    use plonky2_field::types::Field;
+
+    use super::*;
+    use crate::gates::gate::Gate;
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
     use crate::gates::poseidon_mds::PoseidonMdsGate;
+    use crate::gates::util::StridedConstraintConsumer;
+    use crate::hash::hash_types::HashOut;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
+    use crate::plonk::vars::EvaluationVarsBaseBatch;
 
     #[test]
     fn low_degree() {
@@ -299,5 +348,82 @@ mod tests {
         type F = <C as GenericConfig<D>>::F;
         let gate = PoseidonMdsGate::<F, D>::new();
         test_eval_fns::<F, C, _, D>(gate)
+    }
+
+    fn assert_packed_matches_scalar<const D: usize>()
+    where
+        GoldilocksField: Extendable<D>,
+    {
+        type F = GoldilocksField;
+        type P = <F as Packable>::Packing;
+
+        let gate = PoseidonMdsGate::<F, D>::new();
+        let packing_width = <P as PackedField>::WIDTH;
+        let batch_sizes = [
+            1,
+            2,
+            packing_width.saturating_sub(1),
+            packing_width,
+            packing_width + 1,
+            2 * packing_width + 3,
+        ];
+
+        for &batch_size in &batch_sizes {
+            if batch_size == 0 {
+                continue;
+            }
+            for all_zero in [true, false] {
+                let local_wires = (0..gate.num_wires())
+                    .flat_map(|wire| {
+                        (0..batch_size).map(move |point| {
+                            if all_zero {
+                                F::ZERO
+                            } else {
+                                let index = wire * batch_size + point;
+                                match index % 5 {
+                                    0 => F::ZERO,
+                                    1 => F::ONE,
+                                    2 => F::NEG_ONE,
+                                    3 => F::from_noncanonical_u64(
+                                        u64::MAX.wrapping_sub(index as u64),
+                                    ),
+                                    _ => F::from_noncanonical_u64(
+                                        0x9e37_79b9_7f4a_7c15u64 ^ index as u64,
+                                    ),
+                                }
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let local_constants: Vec<F> = Vec::new();
+                let public_inputs_hash = HashOut::ZERO;
+                let vars_batch = EvaluationVarsBaseBatch::new(
+                    batch_size,
+                    &local_constants,
+                    &local_wires,
+                    &public_inputs_hash,
+                );
+
+                let packed = gate.eval_unfiltered_base_batch(vars_batch);
+                let mut scalar = vec![F::ZERO; batch_size * gate.num_constraints()];
+                for point in 0..batch_size {
+                    gate.eval_unfiltered_base_one(
+                        vars_batch.view(point),
+                        StridedConstraintConsumer::new(&mut scalar, batch_size, point),
+                    );
+                }
+
+                assert_eq!(
+                    packed, scalar,
+                    "D={D}, batch_size={batch_size}, all_zero={all_zero}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn packed_base_eval_matches_scalar_for_d2_and_d4() {
+        assert_packed_matches_scalar::<2>();
+        assert_packed_matches_scalar::<4>();
     }
 }

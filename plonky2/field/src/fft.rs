@@ -60,6 +60,33 @@ pub fn fft_with_options<F: Field>(
     PolynomialValues::new(buffer)
 }
 
+/// Transform coefficients with an implicit zero suffix. Initialize the expanded
+/// buffer directly after bit reversal and the known-zero butterfly stages.
+/// This avoids writing, permuting, and then overwriting the padded zeros.
+pub fn fft_with_zero_padding<F: Field>(
+    poly: PolynomialCoeffs<F>,
+    rate_bits: usize,
+    root_table: Option<&FftRootTable<F>>,
+) -> PolynomialValues<F> {
+    if rate_bits == 0 {
+        return fft_with_options(poly, None, root_table);
+    }
+    let mut coefficients = poly.coeffs;
+    let n = coefficients.len() << rate_bits;
+    let lg_n = log2_strict(n);
+    let computed_roots = root_table.is_none().then(|| fft_root_table(n));
+    let roots = root_table.or(computed_roots.as_ref()).unwrap();
+    assert_eq!(roots.len(), lg_n);
+    reverse_index_bits_in_place(&mut coefficients);
+    let expansion = 1 << rate_bits;
+    let mut values = Vec::with_capacity(n);
+    for coefficient in coefficients {
+        values.resize(values.len() + expansion, coefficient);
+    }
+    fft_classic_after_init(&mut values, rate_bits, lg_n, roots);
+    PolynomialValues::new(values)
+}
+
 #[inline]
 pub fn ifft<F: Field>(poly: PolynomialValues<F>) -> PolynomialCoeffs<F> {
     ifft_with_options(poly, None, None)
@@ -192,6 +219,16 @@ pub(crate) fn fft_classic<F: Field>(values: &mut [F], r: usize, root_table: &Fft
         }
     }
 
+    fft_classic_after_init(values, r, lg_n, root_table);
+}
+
+#[inline]
+fn fft_classic_after_init<F: Field>(
+    values: &mut [F],
+    r: usize,
+    lg_n: usize,
+    root_table: &FftRootTable<F>,
+) {
     let lg_packed_width = log2_strict(<F as Packable>::Packing::WIDTH);
 
     if lg_n <= lg_packed_width {
@@ -213,6 +250,30 @@ mod tests {
     use crate::goldilocks_field::GoldilocksField;
     use crate::polynomial::{PolynomialCoeffs, PolynomialValues};
     use crate::types::Field;
+
+    #[test]
+    fn implicit_padding_matches_full_fft() {
+        type F = GoldilocksField;
+        for degree_bits in 0..=8 {
+            let coeffs = (0..1 << degree_bits)
+                .map(|i| F::from_noncanonical_u64(u64::MAX.wrapping_sub(i as u64 * 7919)))
+                .collect::<Vec<_>>();
+            for rate_bits in 0..=5 {
+                let mut padded = coeffs.clone();
+                padded.resize(coeffs.len() << rate_bits, F::ZERO);
+                let expected = fft(PolynomialCoeffs::new(padded));
+                let actual = super::fft_with_zero_padding(
+                    PolynomialCoeffs::new(coeffs.clone()),
+                    rate_bits,
+                    None,
+                );
+                assert_eq!(
+                    actual, expected,
+                    "degree_bits={degree_bits} rate_bits={rate_bits}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn fft_and_ifft() {

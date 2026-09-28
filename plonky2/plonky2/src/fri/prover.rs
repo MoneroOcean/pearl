@@ -180,26 +180,20 @@ pub(crate) fn fri_proof_of_work<
     let witness_input_pos = challenger.input_buffer.len();
     duplex_intermediate_state.set_from_iter(challenger.input_buffer.clone(), 0);
 
-    // Assert RATE=8 since permute_n::<8>() is hardcoded below
+    // Batched and scalar grinding both preserve the eight-element response.
     debug_assert_eq!(<C::Hasher as Hasher<F>>::Permutation::RATE, 8);
 
-    let chunk_size = 1u64 << config.proof_of_work_bits.saturating_sub(16);
+    let chunk_size = (1u64 << config.proof_of_work_bits.saturating_sub(16)).max(128);
     let num_chunks = F::NEG_ONE.to_canonical_u64() / chunk_size;
     let pow_witness = (0..num_chunks)
         .into_par_iter()
         .find_map_any(|chunk_idx| {
             let base = chunk_idx * chunk_size;
-            for offset in 0..chunk_size {
-                let candidate = base + offset;
-                let mut duplex_state = duplex_intermediate_state;
-                duplex_state.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
-                duplex_state.permute_n::<8>();
-                let pow_response = duplex_state.squeeze().last().unwrap();
-                if pow_response.to_canonical_u64().leading_zeros() >= min_leading_zeros {
-                    return Some(candidate);
-                }
-            }
-            None
+            duplex_intermediate_state.find_pow_witness(
+                base..base + chunk_size,
+                witness_input_pos,
+                min_leading_zeros,
+            )
         })
         .map(F::from_canonical_u64)
         .expect("Proof of work failed. This is highly unlikely!");

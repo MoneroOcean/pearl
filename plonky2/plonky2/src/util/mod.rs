@@ -31,6 +31,30 @@ pub fn transpose<T: Send + Sync + Copy>(matrix: &[Vec<T>]) -> Vec<Vec<T>> {
         .collect()
 }
 
+/// Transpose a group of adjacent columns together so each input cache line is
+/// consumed before moving to the next row. Output rows retain separate ownership.
+pub fn transpose_rows<T: Send + Sync + Copy, R: AsRef<[T]> + Sync>(matrix: &[R]) -> Vec<Vec<T>> {
+    const TILE: usize = 32;
+    let len = matrix[0].as_ref().len();
+    (0..len.div_ceil(TILE))
+        .into_par_iter()
+        .flat_map_iter(|tile| {
+            let start = tile * TILE;
+            let width = (len - start).min(TILE);
+            let mut outputs = (0..width)
+                .map(|_| Vec::with_capacity(matrix.len()))
+                .collect::<Vec<_>>();
+            for row in matrix {
+                for (output, &value) in outputs.iter_mut().zip(&row.as_ref()[start..start + width])
+                {
+                    output.push(value);
+                }
+            }
+            outputs
+        })
+        .collect()
+}
+
 /// Evaluate multiple polynomials at multiple points.
 ///
 /// Returns `ret: Vec<Vec<F>>` indexed as `ret[point_idx][poly_idx]`.
@@ -83,6 +107,18 @@ mod tests {
     use alloc::vec;
 
     use super::*;
+
+    #[test]
+    fn tiled_transpose_matches_reference() {
+        for rows in [1, 7, 32, 65, 137] {
+            for cols in [0, 1, 31, 32, 33, 64, 79] {
+                let input: Vec<Vec<usize>> = (0..rows)
+                    .map(|row| (0..cols).map(|col| row * 1000 + col).collect())
+                    .collect();
+                assert_eq!(transpose_rows(&input), transpose(&input));
+            }
+        }
+    }
 
     #[test]
     fn test_reverse_bits() {

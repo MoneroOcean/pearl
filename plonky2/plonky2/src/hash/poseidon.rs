@@ -776,6 +776,14 @@ pub trait Poseidon: PrimeField64 {
         state
     }
 
+    /// Independent permutations in the field's native SIMD packing.
+    #[inline]
+    fn poseidon_native_packed(
+        state: [Self::Packing; SPONGE_WIDTH],
+    ) -> [Self::Packing; SPONGE_WIDTH] {
+        crate::hash::poseidon_batch::packed_poseidon_permutation::<Self, Self::Packing>(state)
+    }
+
     // For testing only, to ensure that various tricks are correct.
     #[inline]
     fn partial_rounds_naive(state: &mut [Self; SPONGE_WIDTH], round_ctr: &mut usize) {
@@ -816,11 +824,68 @@ impl<T> AsRef<[T]> for PoseidonPermutation<T> {
 
 trait Permuter: Sized {
     fn permute(input: [Self; SPONGE_WIDTH]) -> [Self; SPONGE_WIDTH];
+
+    fn find_pow_witness(
+        input: [Self; SPONGE_WIDTH],
+        candidates: core::ops::Range<u64>,
+        witness_input_pos: usize,
+        min_leading_zeros: u32,
+    ) -> Option<u64>
+    where
+        Self: PrimeField64,
+    {
+        for candidate in candidates {
+            let mut state = input;
+            state[witness_input_pos] = Self::from_canonical_u64(candidate);
+            if Self::permute(state)[7].to_canonical_u64().leading_zeros() >= min_leading_zeros {
+                return Some(candidate);
+            }
+        }
+        None
+    }
 }
 
 impl<F: Poseidon> Permuter for F {
     fn permute(input: [Self; SPONGE_WIDTH]) -> [Self; SPONGE_WIDTH] {
         <F as Poseidon>::poseidon(input)
+    }
+
+    fn find_pow_witness(
+        input: [Self; SPONGE_WIDTH],
+        candidates: core::ops::Range<u64>,
+        witness_input_pos: usize,
+        min_leading_zeros: u32,
+    ) -> Option<u64> {
+        let width = <F::Packing as PackedField>::WIDTH;
+        let mut start = candidates.start;
+        if width >= 8 {
+            let initial = input.map(F::Packing::from);
+            while candidates.end - start >= width as u64 {
+                let mut state = initial;
+                for (lane, witness) in state[witness_input_pos]
+                    .as_slice_mut()
+                    .iter_mut()
+                    .enumerate()
+                {
+                    *witness = F::from_canonical_u64(start + lane as u64);
+                }
+                let result = F::poseidon_native_packed(state);
+                for (lane, response) in result[7].as_slice().iter().enumerate() {
+                    if response.to_canonical_u64().leading_zeros() >= min_leading_zeros {
+                        return Some(start + lane as u64);
+                    }
+                }
+                start += width as u64;
+            }
+        }
+        for candidate in start..candidates.end {
+            let mut state = input;
+            state[witness_input_pos] = F::from_canonical_u64(candidate);
+            if F::poseidon(state)[7].to_canonical_u64().leading_zeros() >= min_leading_zeros {
+                return Some(candidate);
+            }
+        }
+        None
     }
 }
 
@@ -864,6 +929,20 @@ impl<T: Copy + Debug + Default + Eq + Permuter + Send + Sync> PlonkyPermutation<
         self.state = T::permute(self.state);
     }
 
+    fn find_pow_witness(
+        &self,
+        candidates: core::ops::Range<u64>,
+        witness_input_pos: usize,
+        min_leading_zeros: u32,
+    ) -> Option<u64>
+    where
+        T: PrimeField64,
+    {
+        assert!(witness_input_pos < SPONGE_WIDTH);
+        assert!(candidates.start <= candidates.end && candidates.end <= T::ORDER);
+        T::find_pow_witness(self.state, candidates, witness_input_pos, min_leading_zeros)
+    }
+
     fn squeeze(&self) -> &[T] {
         &self.state[..Self::RATE]
     }
@@ -881,8 +960,25 @@ impl<F: RichField> Hasher<F> for PoseidonHash {
         hash_n_to_hash_no_pad::<F, Self::Permutation>(input)
     }
 
+    fn hash_batch_size() -> usize {
+        let width = <F::Packing as PackedField>::WIDTH;
+        if width >= 8 {
+            width
+        } else {
+            1
+        }
+    }
+
+    fn hash_or_noop_batch(inputs: &[&[F]], outputs: &mut [Self::Hash]) {
+        crate::hash::poseidon_batch::hash_or_noop_batch(inputs, outputs);
+    }
+
     fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash {
         compress::<F, Self::Permutation>(left, right)
+    }
+
+    fn two_to_one_batch(left: &[Self::Hash], right: &[Self::Hash], outputs: &mut [Self::Hash]) {
+        crate::hash::poseidon_batch::two_to_one_batch(left, right, outputs);
     }
 }
 

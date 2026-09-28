@@ -12,6 +12,21 @@ use crate::hash::poseidon::{Poseidon, N_PARTIAL_ROUNDS};
 
 #[rustfmt::skip]
 impl Poseidon for GoldilocksField {
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512bw",
+        target_feature = "avx512cd",
+        target_feature = "avx512dq",
+        target_feature = "avx512f",
+        target_feature = "avx512vl"
+    ))]
+    #[inline]
+    fn poseidon_native_packed(
+        state: [Self::Packing; 12],
+    ) -> [Self::Packing; 12] {
+        crate::hash::poseidon_batch_avx512::permute(state)
+    }
+
     // The MDS matrix we use is C + D, where C is the circulant matrix whose first row is given by
     // `MDS_MATRIX_CIRC`, and D is the diagonal matrix whose diagonal is given by `MDS_MATRIX_DIAG`.
     //

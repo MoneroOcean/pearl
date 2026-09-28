@@ -10,13 +10,16 @@ use core::marker::PhantomData;
 use anyhow::Result;
 
 use crate::field::extension::Extendable;
+use crate::field::packed::PackedField;
 use crate::field::types::Field;
 use crate::gates::gate::Gate;
+use crate::gates::packed_util::PackedEvaluableBase;
 use crate::gates::poseidon_mds::PoseidonMdsGate;
 use crate::gates::util::StridedConstraintConsumer;
 use crate::hash::hash_types::RichField;
 use crate::hash::poseidon;
 use crate::hash::poseidon::{Poseidon, SPONGE_WIDTH};
+use crate::hash::poseidon_batch::packed_mds_layer;
 use crate::iop::ext_target::ExtensionTarget;
 use crate::iop::generator::{GeneratedValues, SimpleGenerator, WitnessGeneratorRef};
 use crate::iop::target::Target;
@@ -24,7 +27,10 @@ use crate::iop::wire::Wire;
 use crate::iop::witness::{PartitionWitness, Witness, WitnessWrite};
 use crate::plonk::circuit_builder::CircuitBuilder;
 use crate::plonk::circuit_data::CommonCircuitData;
-use crate::plonk::vars::{EvaluationTargets, EvaluationVars, EvaluationVarsBase};
+use crate::plonk::vars::{
+    EvaluationTargets, EvaluationVars, EvaluationVarsBase, EvaluationVarsBaseBatch,
+    EvaluationVarsBasePacked,
+};
 use crate::util::serialization::{Buffer, IoResult, Read, Write};
 
 /// Evaluates a full Poseidon permutation with 12 state elements.
@@ -282,6 +288,10 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for PoseidonGate<F
         }
     }
 
+    fn eval_unfiltered_base_batch(&self, vars_base: EvaluationVarsBaseBatch<F>) -> Vec<F> {
+        self.eval_unfiltered_base_batch_packed(vars_base)
+    }
+
     fn eval_unfiltered_circuit(
         &self,
         builder: &mut CircuitBuilder<F, D>,
@@ -420,6 +430,109 @@ impl<F: RichField + Extendable<D>, const D: usize> Gate<F, D> for PoseidonGate<F
     }
 }
 
+#[inline(always)]
+fn packed_sbox<P: PackedField>(x: P) -> P {
+    // x |--> x^7, matching Poseidon::sbox_monomial.
+    let x2 = x.square();
+    let x4 = x2.square();
+    let x3 = x * x2;
+    x3 * x4
+}
+
+impl<F: RichField + Extendable<D>, const D: usize> PackedEvaluableBase<F, D>
+    for PoseidonGate<F, D>
+{
+    fn eval_unfiltered_base_packed<P: PackedField<Scalar = F>>(
+        &self,
+        vars: EvaluationVarsBasePacked<P>,
+        mut yield_constr: StridedConstraintConsumer<P>,
+    ) {
+        // Assert that `swap` is binary.
+        let swap = vars.local_wires[Self::WIRE_SWAP];
+        yield_constr.one(swap * (swap - P::ONES));
+
+        // Assert that each delta wire is set properly: `delta_i = swap * (rhs - lhs)`.
+        for i in 0..4 {
+            let input_lhs = vars.local_wires[Self::wire_input(i)];
+            let input_rhs = vars.local_wires[Self::wire_input(i + 4)];
+            let delta_i = vars.local_wires[Self::wire_delta(i)];
+            yield_constr.one(swap * (input_rhs - input_lhs) - delta_i);
+        }
+
+        // Compute the possibly-swapped input layer.
+        let mut state = [P::ZEROS; SPONGE_WIDTH];
+        for i in 0..4 {
+            let delta_i = vars.local_wires[Self::wire_delta(i)];
+            let input_lhs = Self::wire_input(i);
+            let input_rhs = Self::wire_input(i + 4);
+            state[i] = vars.local_wires[input_lhs] + delta_i;
+            state[i + 4] = vars.local_wires[input_rhs] - delta_i;
+        }
+        for i in 8..SPONGE_WIDTH {
+            state[i] = vars.local_wires[Self::wire_input(i)];
+        }
+
+        let mut round_ctr = 0;
+
+        // First set of full rounds.
+        for r in 0..poseidon::HALF_N_FULL_ROUNDS {
+            <F as Poseidon>::constant_layer_packed_field::<F, D, F, P, 1>(&mut state, round_ctr);
+            if r != 0 {
+                for i in 0..SPONGE_WIDTH {
+                    let sbox_in = vars.local_wires[Self::wire_full_sbox_0(r, i)];
+                    yield_constr.one(state[i] - sbox_in);
+                    state[i] = sbox_in;
+                }
+            }
+            for value in &mut state {
+                *value = packed_sbox(*value);
+            }
+            state = packed_mds_layer::<F, P>(&state);
+            round_ctr += 1;
+        }
+
+        // Partial rounds.
+        <F as Poseidon>::partial_first_constant_layer_packed_field::<F, D, F, P, 1>(&mut state);
+        state = <F as Poseidon>::mds_partial_layer_init_packed_field::<F, D, F, P, 1>(&state);
+        for r in 0..(poseidon::N_PARTIAL_ROUNDS - 1) {
+            let sbox_in = vars.local_wires[Self::wire_partial_sbox(r)];
+            yield_constr.one(state[0] - sbox_in);
+            state[0] = packed_sbox(sbox_in);
+            state[0] +=
+                P::Scalar::from_canonical_u64(<F as Poseidon>::FAST_PARTIAL_ROUND_CONSTANTS[r]);
+            state =
+                <F as Poseidon>::mds_partial_layer_fast_packed_field::<F, D, F, P, 1>(&state, r);
+        }
+        let sbox_in = vars.local_wires[Self::wire_partial_sbox(poseidon::N_PARTIAL_ROUNDS - 1)];
+        yield_constr.one(state[0] - sbox_in);
+        state[0] = packed_sbox(sbox_in);
+        state = <F as Poseidon>::mds_partial_layer_fast_packed_field::<F, D, F, P, 1>(
+            &state,
+            poseidon::N_PARTIAL_ROUNDS - 1,
+        );
+        round_ctr += poseidon::N_PARTIAL_ROUNDS;
+
+        // Second set of full rounds.
+        for r in 0..poseidon::HALF_N_FULL_ROUNDS {
+            <F as Poseidon>::constant_layer_packed_field::<F, D, F, P, 1>(&mut state, round_ctr);
+            for i in 0..SPONGE_WIDTH {
+                let sbox_in = vars.local_wires[Self::wire_full_sbox_1(r, i)];
+                yield_constr.one(state[i] - sbox_in);
+                state[i] = sbox_in;
+            }
+            for value in &mut state {
+                *value = packed_sbox(*value);
+            }
+            state = packed_mds_layer::<F, P>(&state);
+            round_ctr += 1;
+        }
+
+        for i in 0..SPONGE_WIDTH {
+            yield_constr.one(state[i] - vars.local_wires[Self::wire_output(i)]);
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct PoseidonGenerator<F: RichField + Extendable<D> + Poseidon, const D: usize> {
     row: usize,
@@ -546,13 +659,20 @@ impl<F: RichField + Extendable<D> + Poseidon, const D: usize> SimpleGenerator<F,
 mod tests {
     use anyhow::Result;
     use plonky2_field::goldilocks_field::GoldilocksField;
+    use plonky2_field::packable::Packable;
+    use plonky2_field::packed::PackedField;
+    use plonky2_field::types::Field;
 
     use super::*;
+    use crate::gates::gate::Gate;
     use crate::gates::gate_testing::{test_eval_fns, test_low_degree};
+    use crate::gates::util::StridedConstraintConsumer;
+    use crate::hash::hash_types::HashOut;
     use crate::iop::generator::generate_partial_witness;
     use crate::iop::witness::PartialWitness;
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
+    use crate::plonk::vars::EvaluationVarsBaseBatch;
 
     #[test]
     fn wire_indices() {
@@ -646,5 +766,79 @@ mod tests {
         type F = <C as GenericConfig<D>>::F;
         let gate = PoseidonGate::<F, 2>::new();
         test_eval_fns::<F, C, _, D>(gate)
+    }
+
+    #[test]
+    fn packed_base_eval_matches_scalar_for_zero_small_and_tail_batches() {
+        const D: usize = 2;
+        type F = GoldilocksField;
+        type Gate = PoseidonGate<F, D>;
+        type P = <F as Packable>::Packing;
+
+        let gate = Gate::new();
+        let packing_width = <P as PackedField>::WIDTH;
+        let batch_sizes = [
+            1,
+            2,
+            packing_width.saturating_sub(1),
+            packing_width,
+            packing_width + 1,
+            2 * packing_width + 3,
+        ];
+
+        // EvaluationVarsBaseBatch cannot represent a zero-length batch because its constructor
+        // checks divisibility by batch_size. The zero case is covered by the all-zero input mode;
+        // the remaining cases cover scalar-only, exact-width, and leftover/tail paths.
+        for &batch_size in &batch_sizes {
+            if batch_size == 0 {
+                continue;
+            }
+            for all_zero in [true, false] {
+                let local_wires = (0..gate.num_wires())
+                    .flat_map(|wire| {
+                        (0..batch_size).map(move |point| {
+                            if all_zero {
+                                F::ZERO
+                            } else {
+                                let index = wire * batch_size + point;
+                                match index % 5 {
+                                    0 => F::ZERO,
+                                    1 => F::ONE,
+                                    2 => F::NEG_ONE,
+                                    3 => F::from_noncanonical_u64(
+                                        u64::MAX.wrapping_sub(index as u64),
+                                    ),
+                                    _ => F::from_noncanonical_u64(
+                                        0x9e37_79b9_7f4a_7c15u64 ^ index as u64,
+                                    ),
+                                }
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let local_constants: Vec<F> = Vec::new();
+                let public_inputs_hash = HashOut::ZERO;
+                let vars_batch = EvaluationVarsBaseBatch::new(
+                    batch_size,
+                    &local_constants,
+                    &local_wires,
+                    &public_inputs_hash,
+                );
+
+                let packed = gate.eval_unfiltered_base_batch(vars_batch);
+                let mut scalar = vec![F::ZERO; batch_size * gate.num_constraints()];
+                for point in 0..batch_size {
+                    gate.eval_unfiltered_base_one(
+                        vars_batch.view(point),
+                        StridedConstraintConsumer::new(&mut scalar, batch_size, point),
+                    );
+                }
+
+                assert_eq!(
+                    packed, scalar,
+                    "batch_size={batch_size}, all_zero={all_zero}"
+                );
+            }
+        }
     }
 }

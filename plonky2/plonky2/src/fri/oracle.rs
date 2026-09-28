@@ -25,6 +25,22 @@ use crate::util::{log2_strict, reverse_bits, reverse_index_bits_in_place, transp
 /// Four (~64 bit) field elements gives ~128 bit security.
 pub const SALT_SIZE: usize = 4;
 
+/// Scale real coefficients and pad directly into the final FFT allocation.
+/// The known-zero suffix can be 127/128 of the final recursion's LDE.
+fn coset_lde<F: Field>(
+    polynomial: &PolynomialCoeffs<F>,
+    shift: F,
+    rate_bits: usize,
+    root_table: Option<&FftRootTable<F>>,
+) -> PolynomialValues<F> {
+    let buffer = shift
+        .powers()
+        .zip(&polynomial.coeffs)
+        .map(|(power, &coeff)| power * coeff)
+        .collect();
+    crate::field::fft::fft_with_zero_padding(PolynomialCoeffs::new(buffer), rate_bits, root_table)
+}
+
 /// Represents a FRI oracle, i.e. a batch of polynomials which have been Merklized.
 #[derive(Eq, PartialEq, Debug)]
 pub struct PolynomialBatch<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
@@ -62,11 +78,19 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         timing: &mut TimingTree,
         fft_root_table: Option<&FftRootTable<F>>,
     ) -> Self {
-        let coeffs = timed!(
-            timing,
-            "IFFT",
-            values.into_par_iter().map(|v| v.ifft()).collect::<Vec<_>>()
-        );
+        let coeffs = {
+            // All polynomials have the same degree, so share one IFFT root table across them.
+            // Keep it scoped here so it is freed before `from_coeffs` allocates the LDEs.
+            let roots = crate::field::fft::fft_root_table(values[0].len());
+            timed!(
+                timing,
+                "IFFT",
+                values
+                    .into_par_iter()
+                    .map(|v| crate::field::fft::ifft_with_options(v, None, Some(&roots)))
+                    .collect::<Vec<_>>()
+            )
+        };
 
         Self::from_coeffs(
             coeffs,
@@ -95,16 +119,13 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         );
 
         let mut leaves = timed!(timing, "transpose LDEs", transpose(&lde_values));
+        drop(lde_values);
         reverse_index_bits_in_place(&mut leaves);
         let merkle_tree = timed!(
             timing,
             "build Merkle tree",
             MerkleTree::new(leaves, cap_height)
         );
-        // Frees lde_values in parallel to the main job
-        rayon::spawn(move || {
-            drop(lde_values);
-        });
 
         Self {
             polynomials,
@@ -125,14 +146,17 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
 
         // If blinding, salt with two random elements to each leaf vector.
         let salt_size = if blinding { SALT_SIZE } else { 0 };
+        let computed_root_table = fft_root_table
+            .is_none()
+            .then(|| crate::field::fft::fft_root_table(degree << rate_bits));
+        let root_table = fft_root_table.or(computed_root_table.as_ref());
+        let shift = F::coset_shift();
 
         polynomials
             .par_iter()
             .map(|p| {
                 assert_eq!(p.len(), degree, "Polynomial degrees inconsistent");
-                p.lde(rate_bits)
-                    .coset_fft_with_options(F::coset_shift(), Some(rate_bits), fft_root_table)
-                    .values
+                coset_lde(p, shift, rate_bits, root_table).values
             })
             .chain(
                 (0..salt_size)
@@ -248,7 +272,12 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
             let lde_final_values = timed!(
                 timing,
                 &format!("perform final FFT {}", lde_final_poly.len()),
-                lde_final_poly.coset_fft(F::coset_shift().into())
+                coset_lde(
+                    &final_poly,
+                    F::coset_shift().into(),
+                    fri_params.config.rate_bits,
+                    None
+                )
             );
             (lde_final_poly, lde_final_values)
         };
@@ -270,5 +299,237 @@ impl<F: RichField + Extendable<D>, C: GenericConfig<D, F = F>, const D: usize>
         };
 
         fri_proof
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::field::extension::quadratic::QuadraticExtension;
+    use crate::field::fft::fft_root_table;
+    use crate::field::polynomial::{PolynomialCoeffs, PolynomialValues};
+    use crate::hash::merkle_tree::MerkleTree;
+    use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
+    use crate::util::timing::TimingTree;
+    use crate::util::{reverse_index_bits_in_place, transpose};
+    use plonky2_field::types::Field;
+
+    use super::{coset_lde, PolynomialBatch};
+
+    const D: usize = 2;
+    type C = PoseidonGoldilocksConfig;
+    type F = <C as GenericConfig<D>>::F;
+
+    fn deterministic_values(num_polynomials: usize, degree: usize) -> Vec<PolynomialValues<F>> {
+        (0..num_polynomials)
+            .map(|polynomial_idx| {
+                PolynomialValues::new(
+                    (0..degree)
+                        .map(|value_idx| {
+                            F::from_canonical_usize(polynomial_idx * degree + value_idx + 1)
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    fn independent_root_lde_values(
+        polynomials: &[PolynomialCoeffs<F>],
+        rate_bits: usize,
+    ) -> Vec<Vec<F>> {
+        polynomials
+            .iter()
+            .map(|polynomial| {
+                polynomial
+                    .lde(rate_bits)
+                    .coset_fft_with_options(F::coset_shift(), Some(rate_bits), None)
+                    .values
+            })
+            .collect()
+    }
+
+    #[test]
+    fn shared_root_tables_match_independent_scalar_commitments() {
+        for &(degree, num_polynomials, rate_bits) in &[(4, 2, 0), (8, 3, 1), (16, 2, 2)] {
+            let values = deterministic_values(num_polynomials, degree);
+            let independent_coeffs = values
+                .iter()
+                .cloned()
+                .map(PolynomialValues::ifft)
+                .collect::<Vec<_>>();
+
+            let mut timing = TimingTree::default();
+            let batch = PolynomialBatch::<F, C, D>::from_values(
+                values,
+                rate_bits,
+                false,
+                0,
+                &mut timing,
+                None,
+            );
+            assert_eq!(batch.polynomials, independent_coeffs);
+
+            let expected_lde = independent_root_lde_values(&independent_coeffs, rate_bits);
+            let actual_lde =
+                PolynomialBatch::<F, C, D>::lde_values(&independent_coeffs, rate_bits, false, None);
+            assert_eq!(actual_lde, expected_lde);
+
+            let mut expected_leaves = transpose(&expected_lde);
+            reverse_index_bits_in_place(&mut expected_leaves);
+            let expected_tree =
+                MerkleTree::<F, <C as GenericConfig<D>>::Hasher>::new(expected_leaves, 0);
+            assert_eq!(batch.merkle_tree.leaves, expected_tree.leaves);
+            assert_eq!(batch.merkle_tree.cap, expected_tree.cap);
+        }
+    }
+
+    #[test]
+    fn supplied_and_computed_lde_root_tables_match_without_blinding() {
+        for &(degree, num_polynomials, rate_bits) in &[(4, 2, 0), (8, 3, 1), (16, 2, 2)] {
+            let coeffs = deterministic_values(num_polynomials, degree)
+                .into_iter()
+                .map(PolynomialValues::ifft)
+                .collect::<Vec<_>>();
+            let roots = fft_root_table(degree << rate_bits);
+
+            let computed = PolynomialBatch::<F, C, D>::lde_values(&coeffs, rate_bits, false, None);
+            let supplied =
+                PolynomialBatch::<F, C, D>::lde_values(&coeffs, rate_bits, false, Some(&roots));
+
+            assert_eq!(computed, supplied);
+            assert_eq!(computed, independent_root_lde_values(&coeffs, rate_bits));
+        }
+    }
+
+    fn small_pseudorandom_coefficients(degree: usize, seed: u64) -> PolynomialCoeffs<F> {
+        let mut state = seed;
+        let coeffs = (0..degree)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                F::from_canonical_u64(state % 1_000_003)
+            })
+            .collect();
+        PolynomialCoeffs::new(coeffs)
+    }
+
+    #[test]
+    fn fused_extension_coset_lde_matches_unoptimized_final_fft() {
+        for rate_bits in [0, 1, 3, 7] {
+            for degree in [1, 2, 8, 32] {
+                let polynomial = PolynomialCoeffs::new(
+                    (0..degree)
+                        .map(|i| {
+                            QuadraticExtension([
+                                F::from_noncanonical_u64(u64::MAX - i as u64),
+                                F::from_canonical_usize(i * 17 + 1),
+                            ])
+                        })
+                        .collect(),
+                );
+                let shift = QuadraticExtension([F::coset_shift(), F::ZERO]);
+                // This deliberately retains the old final-FFT path, including
+                // its lack of a zero-factor hint, as an independent oracle.
+                let expected = polynomial.lde(rate_bits).coset_fft(shift);
+                let roots = fft_root_table(degree << rate_bits);
+                for root_table in [None, Some(&roots)] {
+                    assert_eq!(
+                        coset_lde(&polynomial, shift, rate_bits, root_table),
+                        expected,
+                        "degree={degree}, rate={rate_bits}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fused_coset_lde_matches_padded_reference_and_commitment_digests() {
+        let edge_values = [
+            F::from_noncanonical_u64(u64::MAX),
+            F::from_noncanonical_u64(u64::MAX - 1),
+            F::ZERO,
+            F::ONE,
+            F::NEG_ONE,
+        ];
+
+        for rate_bits in [0, 1, 3, 7] {
+            for degree in [1, 2, 8, 32] {
+                let coeffs = vec![
+                    PolynomialCoeffs::zero(degree),
+                    PolynomialCoeffs::new(
+                        (0..degree)
+                            .map(|i| edge_values[i % edge_values.len()])
+                            .collect(),
+                    ),
+                    small_pseudorandom_coefficients(
+                        degree,
+                        0x9e37_79b9_7f4a_7c15 ^ ((rate_bits as u64) << 32) ^ degree as u64,
+                    ),
+                    small_pseudorandom_coefficients(
+                        degree,
+                        0x243f_6a88_85a3_08d3 ^ ((rate_bits as u64) << 32) ^ degree as u64,
+                    ),
+                    PolynomialCoeffs::new(
+                        (0..degree)
+                            .map(|i| {
+                                if i % 2 == 0 {
+                                    F::from_noncanonical_u64(u64::MAX - i as u64)
+                                } else {
+                                    F::from_canonical_u64(i as u64)
+                                }
+                            })
+                            .collect(),
+                    ),
+                ];
+                let expected_lde = independent_root_lde_values(&coeffs, rate_bits);
+                let expected_tree = if degree << rate_bits >= 8 {
+                    let mut expected_leaves = transpose(&expected_lde);
+                    reverse_index_bits_in_place(&mut expected_leaves);
+                    Some(MerkleTree::<F, <C as GenericConfig<D>>::Hasher>::new(
+                        expected_leaves,
+                        0,
+                    ))
+                } else {
+                    None
+                };
+                let roots = fft_root_table(degree << rate_bits);
+
+                for root_table in [None, Some(&roots)] {
+                    let actual_lde = PolynomialBatch::<F, C, D>::lde_values(
+                        &coeffs, rate_bits, false, root_table,
+                    );
+                    assert_eq!(
+                        actual_lde, expected_lde,
+                        "degree={degree}, rate={rate_bits}"
+                    );
+
+                    if let Some(expected_tree) = &expected_tree {
+                        let mut timing = TimingTree::default();
+                        let batch = PolynomialBatch::<F, C, D>::from_coeffs(
+                            coeffs.clone(),
+                            rate_bits,
+                            false,
+                            0,
+                            &mut timing,
+                            root_table,
+                        );
+                        assert_eq!(
+                            batch.merkle_tree.leaves, expected_tree.leaves,
+                            "degree={degree}, rate={rate_bits}"
+                        );
+                        assert_eq!(
+                            batch.merkle_tree.digests, expected_tree.digests,
+                            "degree={degree}, rate={rate_bits}"
+                        );
+                        assert_eq!(
+                            batch.merkle_tree.cap, expected_tree.cap,
+                            "degree={degree}, rate={rate_bits}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

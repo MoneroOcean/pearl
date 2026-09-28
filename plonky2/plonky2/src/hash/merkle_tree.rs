@@ -99,6 +99,8 @@ pub(crate) fn fill_subtree<F: RichField, H: Hasher<F>>(
     if digests_buf.is_empty() {
         // Base case: single leaf
         H::hash_or_noop(&leaves[0])
+    } else if H::hash_batch_size() >= 8 && leaves.len() <= BATCHED_SUBTREE_LEAVES {
+        fill_batched_subtree::<F, H>(digests_buf, leaves)
     } else {
         // Layout is: left recursive output || left child digest
         //             || right child digest || right recursive output.
@@ -119,6 +121,45 @@ pub(crate) fn fill_subtree<F: RichField, H: Hasher<F>>(
         right_digest_mem.write(right_digest);
         H::two_to_one(left_digest, right_digest)
     }
+}
+
+// Keep scratch bounded independently of the full tree, and retain parallel recursion
+// above this size. Each subtree can batch both leaf and internal-node permutations.
+const BATCHED_SUBTREE_LEAVES: usize = 256;
+
+/// Build a small subtree bottom-up, writing the original interleaved layout.
+fn fill_batched_subtree<F: RichField, H: Hasher<F>>(
+    digests_buf: &mut [MaybeUninit<H::Hash>],
+    leaves: &[Vec<F>],
+) -> H::Hash {
+    assert!(leaves.len().is_power_of_two() && leaves.len() <= BATCHED_SUBTREE_LEAVES);
+    assert_eq!(digests_buf.len(), 2 * (leaves.len() - 1));
+    let mut inputs: [&[F]; BATCHED_SUBTREE_LEAVES] = [&[]; BATCHED_SUBTREE_LEAVES];
+    for (input, leaf) in inputs.iter_mut().zip(leaves) {
+        *input = leaf;
+    }
+    let empty_hash = H::hash_or_noop(&[]);
+    let mut hashes = [empty_hash; BATCHED_SUBTREE_LEAVES];
+    let mut left = [empty_hash; BATCHED_SUBTREE_LEAVES / 2];
+    let mut right = [empty_hash; BATCHED_SUBTREE_LEAVES / 2];
+    H::hash_or_noop_batch(&inputs[..leaves.len()], &mut hashes[..leaves.len()]);
+
+    let mut width = leaves.len();
+    let mut level = 0;
+    while width > 1 {
+        let pairs = width / 2;
+        for pair in 0..pairs {
+            left[pair] = hashes[2 * pair];
+            right[pair] = hashes[2 * pair + 1];
+            let offset = 2 * ((pair << (level + 1)) + (1 << level) - 1);
+            digests_buf[offset].write(left[pair]);
+            digests_buf[offset + 1].write(right[pair]);
+        }
+        H::two_to_one_batch(&left[..pairs], &right[..pairs], &mut hashes[..pairs]);
+        width = pairs;
+        level += 1;
+    }
+    hashes[0]
 }
 
 pub(crate) fn fill_digests_buf<F: RichField, H: Hasher<F>>(
@@ -250,8 +291,72 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::field::extension::Extendable;
-    use crate::hash::merkle_proofs::verify_merkle_proof_to_cap;
-    use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
+    use crate::hash::merkle_proofs::{verify_merkle_proof_to_cap, MerkleProof};
+    use crate::hash::poseidon::PoseidonHash;
+    use crate::plonk::config::{GenericConfig, Hasher, PoseidonGoldilocksConfig};
+
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    struct ScalarPoseidonHash;
+
+    impl<F: RichField> Hasher<F> for ScalarPoseidonHash {
+        const HASH_SIZE: usize = <PoseidonHash as Hasher<F>>::HASH_SIZE;
+        type Hash = HashOut<F>;
+        type Permutation = <PoseidonHash as Hasher<F>>::Permutation;
+
+        fn hash_no_pad(input: &[F]) -> Self::Hash {
+            <PoseidonHash as Hasher<F>>::hash_no_pad(input)
+        }
+
+        fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash {
+            <PoseidonHash as Hasher<F>>::two_to_one(left, right)
+        }
+    }
+
+    fn deterministic_leaves<F, L>(num_leaves: usize, leaf_len: L) -> Vec<Vec<F>>
+    where
+        F: RichField,
+        L: Fn(usize) -> usize,
+    {
+        (0..num_leaves)
+            .map(|leaf_idx| {
+                (0..leaf_len(leaf_idx))
+                    .map(|elt_idx| {
+                        F::from_canonical_u64((leaf_idx * 1_009 + elt_idx * 17 + 3) as u64)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn compare_batched_tree_with_scalar<F: RichField>(
+        leaves: Vec<Vec<F>>,
+        cap_height: usize,
+    ) -> Result<()> {
+        let batched_tree = MerkleTree::<F, PoseidonHash>::new(leaves.clone(), cap_height);
+        let scalar_tree = MerkleTree::<F, ScalarPoseidonHash>::new(leaves.clone(), cap_height);
+
+        assert_eq!(batched_tree.digests, scalar_tree.digests);
+        assert_eq!(batched_tree.cap.0, scalar_tree.cap.0);
+        assert_eq!(batched_tree.cap.digest(), scalar_tree.cap.digest());
+
+        let verify_index = leaves.len() / 2;
+        for (leaf_index, leaf) in leaves.into_iter().enumerate() {
+            let batched_proof: MerkleProof<F, PoseidonHash> = batched_tree.prove(leaf_index);
+            let scalar_proof: MerkleProof<F, ScalarPoseidonHash> = scalar_tree.prove(leaf_index);
+            assert_eq!(batched_proof.siblings, scalar_proof.siblings);
+
+            if leaf_index == verify_index {
+                // This verifier hashes the leaf through the scalar `hash_or_noop` path.
+                verify_merkle_proof_to_cap::<F, PoseidonHash>(
+                    leaf,
+                    leaf_index,
+                    &batched_tree.cap,
+                    &batched_proof,
+                )?;
+            }
+        }
+        Ok(())
+    }
 
     pub(crate) fn random_data<F: RichField>(n: usize, k: usize) -> Vec<Vec<F>> {
         (0..n).map(|_| F::rand_vec(k)).collect()
@@ -314,6 +419,73 @@ pub(crate) mod tests {
 
         verify_all_leaves::<F, C, D>(leaves, 1)?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn batched_poseidon_merkle_tree_matches_scalar_hashing() -> Result<()> {
+        const D: usize = 2;
+        type C = PoseidonGoldilocksConfig;
+        type F = <C as GenericConfig<D>>::F;
+        const LEAF_LENGTHS: [usize; 9] = [0, 1, 2, 3, 4, 7, 8, 9, 64];
+
+        for log_num_leaves in 0..=6 {
+            let num_leaves = 1 << log_num_leaves;
+            for leaf_len in LEAF_LENGTHS {
+                let leaves = deterministic_leaves::<F, _>(num_leaves, |_| leaf_len);
+                for cap_height in 0..=log_num_leaves {
+                    compare_batched_tree_with_scalar(leaves.clone(), cap_height)?;
+                }
+            }
+
+            let leaves = deterministic_leaves::<F, _>(num_leaves, |leaf_idx| 5 + leaf_idx % 5);
+            for cap_height in 0..=log_num_leaves {
+                compare_batched_tree_with_scalar(leaves.clone(), cap_height)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bottom_up_subtree_matches_recursive_layout() {
+        use crate::field::goldilocks_field::GoldilocksField as F;
+        use crate::field::types::Field;
+
+        // Exercise the bottom-up layout even on targets where SIMD is disabled.
+        for log_num_leaves in 0..=8 {
+            for leaf_len in [0, 4, 9, 65] {
+                let mut leaves = deterministic_leaves::<F, _>(1 << log_num_leaves, |_| leaf_len);
+                for (idx, leaf) in leaves.iter_mut().enumerate() {
+                    if let Some(first) = leaf.first_mut() {
+                        *first = F::from_noncanonical_u64(u64::MAX - idx as u64);
+                    }
+                }
+                let expected = MerkleTree::<F, ScalarPoseidonHash>::new(leaves.clone(), 0);
+                let mut output = vec![MaybeUninit::uninit(); 2 * (leaves.len() - 1)];
+                let root = fill_batched_subtree::<F, PoseidonHash>(&mut output, &leaves);
+                assert_eq!(root, expected.cap.0[0]);
+                for (actual, expected) in output.into_iter().zip(expected.digests) {
+                    // SAFETY: the helper writes every non-root digest exactly once.
+                    assert_eq!(unsafe { actual.assume_init() }, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batched_merkle_subtree_boundaries_match_scalar() -> Result<()> {
+        use crate::field::goldilocks_field::GoldilocksField as F;
+        use crate::field::types::Field;
+
+        for log_num_leaves in [7, 8, 9, 10] {
+            let mut leaves = deterministic_leaves::<F, _>(1 << log_num_leaves, |_| 9);
+            for (idx, leaf) in leaves.iter_mut().enumerate() {
+                leaf[0] = F::from_noncanonical_u64(u64::MAX - idx as u64);
+            }
+            for cap_height in [0, 1, 2, log_num_leaves - 1, log_num_leaves] {
+                compare_batched_tree_with_scalar(leaves.clone(), cap_height)?;
+            }
+        }
         Ok(())
     }
 }

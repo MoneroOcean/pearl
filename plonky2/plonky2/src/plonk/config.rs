@@ -74,7 +74,29 @@ pub trait Hasher<F: RichField>: Sized + Copy + Debug + Eq + PartialEq {
         }
     }
 
+    /// Number of independent messages efficiently hashed together on this target.
+    fn hash_batch_size() -> usize {
+        1
+    }
+
+    /// Hash independent leaves while preserving `hash_or_noop` semantics.
+    fn hash_or_noop_batch(inputs: &[&[F]], outputs: &mut [Self::Hash]) {
+        assert_eq!(inputs.len(), outputs.len());
+        for (input, output) in inputs.iter().zip(outputs) {
+            *output = Self::hash_or_noop(input);
+        }
+    }
+
     fn two_to_one(left: Self::Hash, right: Self::Hash) -> Self::Hash;
+
+    /// Compress independent pairs while preserving `two_to_one` semantics.
+    fn two_to_one_batch(left: &[Self::Hash], right: &[Self::Hash], outputs: &mut [Self::Hash]) {
+        assert_eq!(left.len(), right.len());
+        assert_eq!(left.len(), outputs.len());
+        for ((&left, &right), output) in left.iter().zip(right).zip(outputs) {
+            *output = Self::two_to_one(left, right);
+        }
+    }
 }
 
 /// Trait for algebraic hash functions, built from a permutation using the sponge construction.

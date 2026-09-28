@@ -13,6 +13,8 @@ maturin develop          # debug build, installs into current venv
 maturin develop --release  # optimized build
 ```
 
+For an optional build-time optimization, see [profile-guided builds](PGO.md).
+
 ## Mining
 
 Mining searches for a matrix solution that satisfies the proof-of-work target.

@@ -90,22 +90,51 @@ impl<F: Field> ReducingFactor<F> {
         F: FieldExtension<D, BaseField = BF>,
     {
         self.count += polys.len() as u64;
-        let alpha_powers: Vec<F> = self.base.powers().take(polys.len()).collect();
+        let alpha_powers: Vec<[BF; D]> = self
+            .base
+            .powers()
+            .take(polys.len())
+            .map(|power| power.to_basefield_array())
+            .collect();
         let num_coeffs = polys.first().map_or(0, |p| p.len());
 
-        // result[i] = sum_j (alpha^j * polys[j].coeffs[i])
-        PolynomialCoeffs::new(
-            (0..num_coeffs)
-                .into_par_iter()
-                .map(|i| {
-                    polys
-                        .iter()
-                        .zip(&alpha_powers)
-                        .map(|(p, &alpha_j)| alpha_j.scalar_mul(p.coeffs[i]))
-                        .sum()
-                })
-                .collect(),
-        )
+        // Consume consecutive coefficients in native packed groups. This uses
+        // each input cache line for several outputs and shares alpha broadcasts.
+        let mut result = vec![F::ZERO; num_coeffs];
+        result
+            .par_chunks_mut(256)
+            .enumerate()
+            .for_each(|(chunk, output)| {
+                let width = BF::Packing::WIDTH;
+                let packed_len = output.len() / width * width;
+                for offset in (0..packed_len).step_by(width) {
+                    let index = chunk * 256 + offset;
+                    let mut sums = [BF::Packing::ZEROS; D];
+                    for (poly, alpha) in polys.iter().zip(&alpha_powers) {
+                        let coeff = *BF::Packing::from_slice(&poly.coeffs[index..index + width]);
+                        for dim in 0..D {
+                            sums[dim] += coeff * alpha[dim];
+                        }
+                    }
+                    for lane in 0..width {
+                        output[offset + lane] =
+                            F::from_basefield_array(core::array::from_fn(|dim| {
+                                sums[dim].as_slice()[lane]
+                            }));
+                    }
+                }
+                for offset in packed_len..output.len() {
+                    let index = chunk * 256 + offset;
+                    let mut sums = [BF::ZERO; D];
+                    for (poly, alpha) in polys.iter().zip(&alpha_powers) {
+                        for dim in 0..D {
+                            sums[dim] += poly.coeffs[index] * alpha[dim];
+                        }
+                    }
+                    output[offset] = F::from_basefield_array(sums);
+                }
+            });
+        PolynomialCoeffs::new(result)
     }
 
     pub fn shift(&mut self, x: F) -> F {
@@ -288,6 +317,45 @@ mod tests {
     use crate::plonk::circuit_data::CircuitConfig;
     use crate::plonk::config::{GenericConfig, PoseidonGoldilocksConfig};
     use crate::plonk::verifier::verify;
+
+    #[test]
+    fn packed_polynomial_reduction_matches_scalar() {
+        type B = crate::field::goldilocks_field::GoldilocksField;
+        type E = crate::field::extension::quadratic::QuadraticExtension<B>;
+        let alpha = E::from_basefield_array([B::from_canonical_u64(7), B::from_canonical_u64(13)]);
+        for count in [0, 1, 3, 17] {
+            for length in [0, 1, 7, 8, 9, 255, 256, 257, 512] {
+                let polys = (0..count)
+                    .map(|poly| {
+                        PolynomialCoeffs::new(
+                            (0..length)
+                                .map(|i| {
+                                    B::from_noncanonical_u64(
+                                        u64::MAX.wrapping_sub((poly * 1021 + i * 71) as u64),
+                                    )
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let refs = polys.iter().collect::<Vec<_>>();
+                let powers = alpha.powers().take(count).collect::<Vec<_>>();
+                let expected = (0..if count == 0 { 0 } else { length })
+                    .map(|i| {
+                        polys
+                            .iter()
+                            .zip(&powers)
+                            .map(|(p, a)| <E as FieldExtension<2>>::scalar_mul(a, p.coeffs[i]))
+                            .sum::<E>()
+                    })
+                    .collect::<Vec<_>>();
+                let mut factor = ReducingFactor::new(alpha);
+                let actual = factor.reduce_polys_base::<B, 2>(&refs);
+                assert_eq!(actual.coeffs, expected, "count={count},length={length}");
+                assert_eq!(factor.shift(E::ONE), alpha.exp_u64(count as u64));
+            }
+        }
+    }
 
     fn test_reduce_gadget_base(n: usize) -> Result<()> {
         const D: usize = 2;

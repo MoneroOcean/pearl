@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use core::fmt::Debug;
 
 use crate::field::extension::Extendable;
-use crate::field::types::Field;
+use crate::field::types::{Field, PrimeField64};
 use crate::hash::hash_types::{HashOut, HashOutTarget, RichField, NUM_HASH_OUT_ELTS};
 use crate::iop::target::Target;
 use crate::plonk::circuit_builder::CircuitBuilder;
@@ -95,8 +95,42 @@ pub trait PlonkyPermutation<T: Copy + Default>:
         self.permute();
     }
 
+    /// Return the first valid grinding witness in a canonical, half-open range.
+    /// The response is the final element of the eight-element squeeze output.
+    fn find_pow_witness(
+        &self,
+        candidates: core::ops::Range<u64>,
+        witness_input_pos: usize,
+        min_leading_zeros: u32,
+    ) -> Option<u64>
+    where
+        T: PrimeField64,
+    {
+        find_pow_witness_scalar(self, candidates, witness_input_pos, min_leading_zeros)
+    }
+
     /// Return a slice of `RATE` elements
     fn squeeze(&self) -> &[T];
+}
+
+pub(crate) fn find_pow_witness_scalar<F: PrimeField64, P: PlonkyPermutation<F>>(
+    state: &P,
+    candidates: core::ops::Range<u64>,
+    witness_input_pos: usize,
+    min_leading_zeros: u32,
+) -> Option<u64> {
+    assert_eq!(P::RATE, 8);
+    assert!(witness_input_pos < P::WIDTH);
+    assert!(candidates.start <= candidates.end && candidates.end <= F::ORDER);
+    for candidate in candidates {
+        let mut perm = *state;
+        perm.set_elt(F::from_canonical_u64(candidate), witness_input_pos);
+        perm.permute_n::<8>();
+        if perm.squeeze()[7].to_canonical_u64().leading_zeros() >= min_leading_zeros {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 /// A one-way compression function which takes two ~256 bit inputs and returns a ~256 bit output.
@@ -148,4 +182,53 @@ pub fn hash_n_to_m_no_pad<F: RichField, P: PlonkyPermutation<F>>(
 
 pub fn hash_n_to_hash_no_pad<F: RichField, P: PlonkyPermutation<F>>(inputs: &[F]) -> HashOut<F> {
     HashOut::from_vec(hash_n_to_m_no_pad::<F, P>(inputs, NUM_HASH_OUT_ELTS))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::field::goldilocks_field::GoldilocksField as F;
+    use crate::field::types::Field64;
+    use crate::hash::blake3_perm::Blake3Permutation;
+    use crate::hash::poseidon::PoseidonPermutation;
+
+    fn check_pow_search<P: PlonkyPermutation<F>>() {
+        for seed in 0..4u64 {
+            let input: [F; 12] = core::array::from_fn(|i| {
+                F::from_noncanonical_u64(
+                    u64::MAX.wrapping_sub((i as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ seed),
+                )
+            });
+            let state = P::new(input);
+            for position in [0, 3, 7, 11] {
+                for count in [0, 1, 7, 8, 15, 16, 17, 128, 129] {
+                    for start in [seed * 31, F::ORDER - 129] {
+                        let range = start..start + count;
+                        for bits in [0, 2, 5, 65] {
+                            let expected =
+                                find_pow_witness_scalar(&state, range.clone(), position, bits);
+                            let actual = state.find_pow_witness(range.clone(), position, bits);
+                            assert_eq!(
+                                actual, expected,
+                                "seed={seed}, position={position}, range={range:?}, bits={bits}"
+                            );
+                            if bits == 65 || count == 0 {
+                                assert_eq!(actual, None);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn poseidon_batched_pow_search_matches_scalar_first_witness() {
+        check_pow_search::<PoseidonPermutation<F>>();
+    }
+
+    #[test]
+    fn blake3_batched_pow_search_matches_scalar_first_witness() {
+        check_pow_search::<Blake3Permutation<F>>();
+    }
 }
