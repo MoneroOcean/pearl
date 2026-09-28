@@ -9,7 +9,7 @@ import fastjsonschema
 from miner_utils import get_logger
 from pearl_mining import PlainProof
 
-from pearl_gateway.comm.dataclasses import MiningJob, MiningPausedError
+from pearl_gateway.comm.dataclasses import BlockTemplate, MiningJob, MiningPausedError
 from pearl_gateway.config import MinerRpcConfig
 from pearl_gateway.miner_rpc.schemas import (
     validate_get_mining_info,
@@ -21,8 +21,9 @@ from pearl_gateway.work_cache import WorkCache
 
 logger = get_logger(__name__)
 
-# max proof size should be smaller than this
-READER_BUFFER_LIMIT = 2**20
+# Bounded wire allowance for an 8 MiB decoded proof plus base64/JSON overhead.
+READER_BUFFER_LIMIT = 12 * 1024 * 1024
+CLIENT_READ_TIMEOUT_SECONDS = 65
 
 
 @dataclass
@@ -103,10 +104,10 @@ class MinerRpcServer:
     async def _start_tcp(self):
         """Start the server on a TCP port."""
         self.server = await asyncio.start_server(
-            self._handle_client, "127.0.0.1", self.config.port, limit=READER_BUFFER_LIMIT
+            self._handle_client, self.config.host, self.config.port, limit=READER_BUFFER_LIMIT
         )
 
-        logger.info(f"Miner RPC server listening on TCP: 127.0.0.1:{self.config.port}")
+        logger.info(f"Miner RPC server listening on TCP: {self.config.host}:{self.config.port}")
 
     async def stop(self):
         """Stop the RPC server."""
@@ -142,7 +143,9 @@ class MinerRpcServer:
             while True:
                 try:
                     # Read line-delimited JSON-RPC request
-                    line = await reader.readline()
+                    line = await asyncio.wait_for(
+                        reader.readline(), timeout=CLIENT_READ_TIMEOUT_SECONDS
+                    )
                     if not line:
                         break  # Client disconnected
 
@@ -156,15 +159,25 @@ class MinerRpcServer:
 
                 except asyncio.CancelledError:
                     break
+                except TimeoutError:
+                    logger.warning(f"Client read timeout: {client_id}")
+                    break
+                except ValueError:
+                    # StreamReader raises ValueError when a line exceeds its
+                    # configured limit. Close instead of retrying the same input.
+                    logger.warning(f"Client request exceeds limit: {client_id}")
+                    break
                 except Exception as e:
-                    logger.exception(f"Error processing request from {client_id}: {e}")
-                    response = self._jsonrpc_error(-32000, str(e), request_id=None)
+                    logger.exception(
+                        f"Error processing request from {client_id}: {type(e).__name__}"
+                    )
+                    response = self._jsonrpc_error(-32000, "Internal error", request_id=None)
                     response_line = json.dumps(response) + "\n"
                     writer.write(response_line.encode())
                     await writer.drain()
 
         except Exception as e:
-            logger.exception(f"Client handler error for {client_id}: {e}")
+            logger.exception(f"Client handler error for {client_id}: {type(e).__name__}")
         finally:
             # Clean up client - single point of removal
             self.clients.pop(client_id, None)
@@ -181,8 +194,8 @@ class MinerRpcServer:
         """Validate JSON-RPC params, returning an error response on failure or None on success."""
         try:
             validator(params)
-        except fastjsonschema.exceptions.JsonSchemaException as e:
-            return self._jsonrpc_error(-32602, "Invalid params", request_id, data=str(e))
+        except fastjsonschema.exceptions.JsonSchemaException:
+            return self._jsonrpc_error(-32602, "Invalid params", request_id)
         return None
 
     async def _process_request(self, request_line: str, client: ClientInfo) -> dict[str, Any]:
@@ -194,30 +207,36 @@ class MinerRpcServer:
 
             try:
                 validate_jsonrpc(body)
-            except fastjsonschema.exceptions.JsonSchemaException as e:
+            except fastjsonschema.exceptions.JsonSchemaException:
                 envelope_id = body.get("id") if isinstance(body, dict) else None
-                return self._jsonrpc_error(-32600, "Invalid Request", envelope_id, data=str(e))
+                return self._jsonrpc_error(-32600, "Invalid Request", envelope_id)
 
             method = body["method"]
             params = body.get("params", {})
             request_id = body["id"]
 
             logger.debug(f"Processing request: {method}")
-            logger.trace(f"request params: {params}")
-
             if method == "getMiningInfo":
                 if error := self._validate_params(validate_get_mining_info, params, request_id):
                     return error
-                job = await self.work_cache.get_mining_job()
-                return self._jsonrpc_success(job.to_dict(), request_id)
+                # Keep explicit worker_id requests on the legacy variant path.
+                # An omitted or empty params object opts into the compact
+                # worker-0 recipe response.
+                worker_id = params.get("worker_id", 0)
+                job = await self.work_cache.get_mining_job(
+                    worker_id, include_worker_recipe=not params
+                )
+                return self._jsonrpc_success(
+                    job.to_dict(include_worker_recipe=not params), request_id
+                )
 
             elif method == "submitPlainProof":
                 if error := self._validate_params(validate_submit_plain_proof, params, request_id):
                     return error
                 plain_proof = PlainProof.from_base64(params["plain_proof"])
                 mining_job = MiningJob.from_dict(params["mining_job"])
-                asyncio.create_task(self.handle_submit_plain_proof(plain_proof, mining_job))
-                return self._jsonrpc_success("submitted", request_id)
+                result = await self.handle_submit_plain_proof(plain_proof, mining_job)
+                return self._jsonrpc_success(result, request_id)
 
             else:
                 return self._jsonrpc_error(-32601, f"Method {method} not found", request_id)
@@ -226,34 +245,57 @@ class MinerRpcServer:
             logger.info(f"Mining paused: {e}")
             return self._jsonrpc_error(e.code, str(e), request_id)
 
-        except json.JSONDecodeError as e:
-            logger.warning(f"Invalid JSON in request: {e}")
-            return self._jsonrpc_error(-32700, "Parse error", request_id=None, data=str(e))
+        except json.JSONDecodeError:
+            logger.warning("Invalid JSON in request")
+            return self._jsonrpc_error(-32700, "Parse error", request_id=None)
 
         except Exception as e:
-            logger.exception(f"Error handling RPC request: {e}")
-            return self._jsonrpc_error(-32000, str(e), request_id)
+            logger.exception(f"Error handling RPC request: {type(e).__name__}")
+            return self._jsonrpc_error(-32000, "Internal error", request_id)
 
     async def handle_submit_plain_proof(
         self, plain_proof: PlainProof, mining_job: MiningJob
-    ) -> None:
+    ) -> dict[str, Any]:
         """Handle submitPlainProof requests."""
-        # Get the current template (needed to build the full block)
-        if self.work_cache.current_template is None:
-            raise MiningPausedError("no block template available")
-
         logger.trace(f"Submitting plain proof for {mining_job.to_dict()=} and {plain_proof=}")
 
-        current_header_bytes = (
-            self.work_cache.current_template.header.serialize_without_proof_commitment()
-        )
-        if mining_job.incomplete_header_bytes != current_header_bytes:
-            logger.warning("Submitted block with old header. Skipping submission.")
-            return
+        if mining_job.worker_id is None:
+            template = await self.work_cache.get_template_for_header(
+                mining_job.incomplete_header_bytes
+            )
+        else:
+            template = await self.work_cache.get_template_for_header(
+                mining_job.incomplete_header_bytes, mining_job.worker_id
+            )
+        # AsyncMock-based callers from older integrations may not configure the new lookup;
+        # retain exact-header behavior without accepting an arbitrary current template.
+        if not isinstance(template, BlockTemplate):
+            current_template = self.work_cache.current_template
+            template = None
+            if isinstance(current_template, BlockTemplate):
+                if (
+                    current_template.header.serialize_without_proof_commitment()
+                    == mining_job.incomplete_header_bytes
+                ):
+                    template = current_template
+                elif mining_job.worker_id is not None:
+                    try:
+                        variant = current_template.for_worker_id(mining_job.worker_id)
+                    except ValueError:
+                        variant = None
+                    if (
+                        variant is not None
+                        and variant.header.serialize_without_proof_commitment()
+                        == mining_job.incomplete_header_bytes
+                    ):
+                        template = variant
+
+        if template is None:
+            logger.warning("Submitted block with unknown or expired header. Skipping submission.")
+            return {"status": "rejected: unknown or expired header"}
 
         # Submit the block via the submission service
-        result = await self.submission_service.submit_plain_proof(
-            plain_proof, self.work_cache.current_template
-        )
+        result = await self.submission_service.submit_plain_proof(plain_proof, template)
 
         logger.info(f"Block submission result: {result}")
+        return result

@@ -59,6 +59,27 @@ sequenceDiagram
     ProofGenerator->>PearlNode: submit block
 ```
 
+### Worker Derivation in `getMiningInfo`
+
+`getMiningInfo` returns the worker-0 `incomplete_header_bytes` together with a
+compact recipe so a miner can derive worker namespaces locally:
+
+- `worker_coinbase_bytes` is base64 for the worker-0 coinbase transaction in
+  non-witness serialization. `worker_coinbase_offset` is the absolute byte
+  index of its single mutable worker byte; replace that byte with a value from
+  0 through 255.
+- `worker_merkle_branch` is base64 for concatenated 32-byte sibling hashes,
+  one per Merkle level from the coinbase upward. Siblings use internal
+  little-endian hash byte order, and each fold is
+  `double_sha256(left_hash + sibling_hash)` with the coinbase as the left
+  operand. Odd levels duplicate their final hash. Write the final raw hash
+  directly into bytes 36–67 of the 76-byte incomplete header.
+
+The gateway retains `for_worker_id` and exact-header submission reconstruction
+for compatibility with miners that submit a worker-specific header. Requests
+that explicitly provide the legacy `worker_id` parameter continue to receive
+that worker-specific job; omitted or empty params return the worker-0 recipe.
+
 
 ### Installation
 
@@ -129,5 +150,3 @@ The project uses pytest for testing:
 # Run all tests
 pytest
 ```
-
-

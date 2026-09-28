@@ -28,6 +28,41 @@ def calculate_merkle_root(txids: list[str]) -> bytes:
     return _compute_merkle_root(tx_hashes)
 
 
+def calculate_merkle_branch(txids: list[str]) -> bytes:
+    """Return the coinbase-left Merkle branch for ``txids``.
+
+    ``txids`` are display-order (big-endian) hex strings, matching the node's
+    getblocktemplate response.  The returned bytes concatenate one 32-byte
+    sibling per tree level, in low-to-high level order.  Each sibling is the
+    internal little-endian hash byte order used when folding
+    ``double_sha256(left + right)``; the coinbase is always the left operand.
+    An odd level duplicates its final hash using the same rule as
+    :func:`calculate_merkle_root`.
+    """
+    if not txids:
+        raise ValueError("at least one txid is required")
+
+    try:
+        hashes = [bytes.fromhex(txid)[::-1] for txid in txids]
+    except ValueError as exc:
+        raise ValueError("txids must be hexadecimal") from exc
+    if any(len(tx_hash) != 32 for tx_hash in hashes):
+        raise ValueError("txids must be exactly 32 bytes")
+
+    branch: list[bytes] = []
+    while len(hashes) > 1:
+        # The coinbase is at index zero and remains the leftmost node at every
+        # level, so its sibling is the second node in the current level.
+        branch.append(hashes[1])
+        next_level: list[bytes] = []
+        for index in range(0, len(hashes), 2):
+            right = hashes[index + 1] if index + 1 < len(hashes) else hashes[index]
+            next_level.append(double_sha256(hashes[index] + right))
+        hashes = next_level
+
+    return b"".join(branch)
+
+
 def _compute_merkle_root(hashes: list[bytes]) -> bytes:
     """
     Compute merkle root from a list of transaction hashes.
@@ -72,10 +107,18 @@ def create_coinbase_transaction(
     mining_address: str,
     coinbase_aux: dict[str, str] | None = None,
     default_witness_commitment: str | None = None,
+    worker_id: int = 0,
 ) -> Transaction:
     """
     Create a coinbase transaction from scratch.
     """
+    if (
+        isinstance(worker_id, bool)
+        or not isinstance(worker_id, int)
+        or not 0 <= worker_id <= 0xFF
+    ):
+        raise ValueError("worker_id must be an integer from 0 to 255")
+
     script_pubkey = get_script_pubkey_from_p2tr_address(mining_address)
 
     # Build coinbase script (scriptSig)
@@ -84,8 +127,8 @@ def create_coinbase_transaction(
     height_script = Script([height])
     coinbase_script_bytes = bytes.fromhex(height_script.to_hex())
 
-    # Add extra nonce byte (matches node's behavior)
-    coinbase_script_bytes += b"\x00"
+    # Keep one fixed-width byte after the BIP34 height to namespace pool workers.
+    coinbase_script_bytes += bytes([worker_id])
 
     if coinbase_aux and "flags" in coinbase_aux:
         aux_flags = bytes.fromhex(coinbase_aux["flags"])

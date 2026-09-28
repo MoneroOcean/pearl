@@ -160,6 +160,15 @@ class TestGetMiningInfoSchema:
         ):
             validate_get_mining_info(invalid_params)
 
+    @pytest.mark.parametrize("worker_id", [0, 255])
+    def test_worker_id_boundaries_are_valid(self, worker_id):
+        validate_get_mining_info({"worker_id": worker_id})
+
+    @pytest.mark.parametrize("worker_id", [-1, 256, 1.5, "1", False, True])
+    def test_worker_id_out_of_range_or_wrong_type_is_invalid(self, worker_id):
+        with pytest.raises(fastjsonschema.JsonSchemaException):
+            validate_get_mining_info({"worker_id": worker_id})
+
 
 class TestSubmitPlainProofSchema:
     """Test submitPlainProof method schema validation."""
@@ -167,6 +176,21 @@ class TestSubmitPlainProofSchema:
     def test_valid_submit_plain_proof_params(self, submit_plain_proof_params):
         """Test valid submitPlainProof parameters."""
         validate_submit_plain_proof(submit_plain_proof_params)
+
+    @pytest.mark.parametrize("worker_id", [0, 255])
+    def test_worker_id_boundaries_are_valid(self, submit_plain_proof_params, worker_id):
+        params = submit_plain_proof_params.copy()
+        params["mining_job"] = {**params["mining_job"], "worker_id": worker_id}
+
+        validate_submit_plain_proof(params)
+
+    @pytest.mark.parametrize("worker_id", [-1, 256, False, True, "1"])
+    def test_invalid_worker_id_is_rejected(self, submit_plain_proof_params, worker_id):
+        params = submit_plain_proof_params.copy()
+        params["mining_job"] = {**params["mining_job"], "worker_id": worker_id}
+
+        with pytest.raises(fastjsonschema.JsonSchemaException):
+            validate_submit_plain_proof(params)
 
     def test_empty_params_invalid(self):
         """Test empty params for submitPlainProof are invalid."""
@@ -248,7 +272,7 @@ class TestSubmitPlainProofSchema:
     def test_invalid_header_bytes_format(self, submit_plain_proof_params):
         """Test invalid base64 format in incomplete_header_bytes."""
         invalid_params = submit_plain_proof_params.copy()
-        invalid_params["mining_job"]["incomplete_header_bytes"] = "invalid_base64!"
+        invalid_params["mining_job"]["incomplete_header_bytes"] = "!" * 104
         with pytest.raises(fastjsonschema.JsonSchemaException, match="must match pattern"):
             validate_submit_plain_proof(invalid_params)
 
@@ -265,6 +289,6 @@ class TestSubmitPlainProofSchema:
         invalid_params["mining_job"]["target"] = -1
         with pytest.raises(
             fastjsonschema.JsonSchemaException,
-            match="must be bigger than or equal to 0",
+            match='must be bigger than or equal to 1',
         ):
             validate_submit_plain_proof(invalid_params)

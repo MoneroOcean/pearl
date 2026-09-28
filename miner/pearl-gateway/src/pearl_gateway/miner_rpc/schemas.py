@@ -1,5 +1,10 @@
 import fastjsonschema
 
+from pearl_gateway.comm.dataclasses import (
+    MAX_WORKER_COINBASE_BYTES,
+    MAX_WORKER_MERKLE_BRANCH_BYTES,
+)
+
 """
 JSON Schema definitions for validating JSON-RPC requests in PearlGateway.
 """
@@ -17,11 +22,20 @@ JSON_RPC_SCHEMA = {
     "additionalProperties": False,
 }
 
-# Schema for getMiningInfo request (no params required)
-GET_MINING_INFO_SCHEMA = {"type": "object", "additionalProperties": False}
+# Schema for getMiningInfo request.  Empty params keep the worker-0 behavior.
+GET_MINING_INFO_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "worker_id": {"type": "integer", "minimum": 0, "maximum": 255},
+    },
+    "additionalProperties": False,
+}
 
 # Base64 pattern for encoding
-BASE64_PATTERN = "^[A-Za-z0-9+/]*={0,2}$"
+BASE64_PATTERN = "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+MAX_PROOF_BASE64_CHARS = ((8 * 1024 * 1024 + 2) // 3) * 4
+MAX_WORKER_COINBASE_BASE64_CHARS = ((MAX_WORKER_COINBASE_BYTES + 2) // 3) * 4
+MAX_WORKER_MERKLE_BRANCH_BASE64_CHARS = ((MAX_WORKER_MERKLE_BRANCH_BYTES + 2) // 3) * 4
 
 # Schema for submitPlainProof request - simplified to just base64 string + mining_job
 SUBMIT_PLAIN_PROOF_SCHEMA = {
@@ -31,15 +45,48 @@ SUBMIT_PLAIN_PROOF_SCHEMA = {
         "mining_job",
     ],
     "properties": {
-        "plain_proof": {"type": "string", "pattern": BASE64_PATTERN},
+        "plain_proof": {
+            "type": "string",
+            "pattern": BASE64_PATTERN,
+            "minLength": 4,
+            "maxLength": MAX_PROOF_BASE64_CHARS,
+        },
         "mining_job": {
             "type": "object",
             "required": ["incomplete_header_bytes", "target", "cert_version"],
             "properties": {
-                "incomplete_header_bytes": {"type": "string", "pattern": BASE64_PATTERN},
-                "target": {"type": "integer", "minimum": 0},
+                "incomplete_header_bytes": {
+                    "type": "string",
+                    "pattern": BASE64_PATTERN,
+                    "minLength": 104,
+                    "maxLength": 104,
+                },
+                "target": {"type": "integer", "minimum": 1},
+                "target_decimal": {
+                    "type": "string",
+                    "pattern": "^[1-9][0-9]{0,77}$",
+                },
                 "cert_version": {"type": "integer", "minimum": 1},
+                "expected_reward": {"type": "integer", "minimum": 0},
+                "worker_id": {"type": "integer", "minimum": 0, "maximum": 255},
+                "worker_coinbase_bytes": {
+                    "type": "string",
+                    "pattern": BASE64_PATTERN,
+                    "minLength": 4,
+                    "maxLength": MAX_WORKER_COINBASE_BASE64_CHARS,
+                },
+                "worker_coinbase_offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": MAX_WORKER_COINBASE_BYTES - 1,
+                },
+                "worker_merkle_branch": {
+                    "type": "string",
+                    "pattern": BASE64_PATTERN,
+                    "maxLength": MAX_WORKER_MERKLE_BRANCH_BASE64_CHARS,
+                },
             },
+            "additionalProperties": False,
         },
     },
     "additionalProperties": False,

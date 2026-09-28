@@ -1,11 +1,11 @@
 import base64
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
-import torch
 from bitcoinutils.transactions import Transaction
 from pearl_gateway.blockchain_utils.blockchain_utils import (
     bits_to_target,
+    calculate_merkle_branch,
     calculate_merkle_root,
     create_coinbase_transaction,
 )
@@ -20,6 +20,11 @@ from pearl_gateway.rpc_types import (
     GetBlockTemplateResponse,
 )
 from pearl_mining import PENALTY_BASE_RANK, IncompleteBlockHeader, penalized_target_bound
+
+UINT256_MAX = (1 << 256) - 1
+INCOMPLETE_HEADER_BYTES = 76
+MAX_WORKER_COINBASE_BYTES = 1024
+MAX_WORKER_MERKLE_BRANCH_BYTES = 1024
 
 
 def get_bytes(data: str | bytes) -> bytes:
@@ -36,11 +41,6 @@ def b64_decode(data: str) -> bytes:
     return base64.b64decode(data.encode("ascii"))
 
 
-def decode_dtype(encoded_dtype: str) -> torch.dtype:
-    # dtype is serialized as "torch.dtype"
-    return getattr(torch, encoded_dtype.replace("torch.", ""))
-
-
 @dataclass
 class BlockTemplate:
     """Represents a block template fetched from the Pearl node."""
@@ -51,10 +51,14 @@ class BlockTemplate:
     coinbase_tx: Transaction
     # Certificate version this block must carry under the crossover cutover.
     required_cert_version: CertificateVersion
+    coinbase_value: int = 0
+    source_data: GetBlockTemplateResponse | None = field(default=None, repr=False, compare=False)
+    mining_address: str | None = field(default=None, repr=False, compare=False)
+    worker_id: int = 0
 
     @classmethod
     def from_get_block_template(
-        cls, data: GetBlockTemplateResponse, mining_address: str
+        cls, data: GetBlockTemplateResponse, mining_address: str, worker_id: int = 0
     ) -> "BlockTemplate":
         previousblockhash = data.previousblockhash
         version = data.version
@@ -67,6 +71,7 @@ class BlockTemplate:
             mining_address=mining_address,
             coinbase_aux=data.coinbaseaux.model_dump(),
             default_witness_commitment=data.default_witness_commitment,
+            worker_id=worker_id,
         )
         raw_transactions = [bytes.fromhex(tx.data) for tx in data.transactions]
         txids = [tx.txid for tx in data.transactions]
@@ -93,6 +98,56 @@ class BlockTemplate:
             raw_transactions=raw_transactions,
             coinbase_tx=coinbase_tx,
             required_cert_version=CertificateVersion(data.requiredcertversion),
+            coinbase_value=data.coinbasevalue,
+            source_data=data,
+            mining_address=mining_address,
+            worker_id=worker_id,
+        )
+
+    def for_worker_id(self, worker_id: int) -> "BlockTemplate":
+        if (
+            isinstance(worker_id, bool)
+            or not isinstance(worker_id, int)
+            or not 0 <= worker_id <= 0xFF
+        ):
+            raise ValueError("worker_id must be an integer from 0 to 255")
+        if worker_id == self.worker_id:
+            return self
+        if self.source_data is None or self.mining_address is None:
+            raise ValueError("block template cannot derive worker variants")
+
+        coinbase_tx = create_coinbase_transaction(
+            height=self.source_data.height,
+            coinbase_value=self.source_data.coinbasevalue,
+            mining_address=self.mining_address,
+            coinbase_aux=self.source_data.coinbaseaux.model_dump(),
+            default_witness_commitment=self.source_data.default_witness_commitment,
+            worker_id=worker_id,
+        )
+        merkle_root = calculate_merkle_root(
+            [coinbase_tx.get_txid()] + [tx.txid for tx in self.source_data.transactions]
+        )
+
+        return type(self)(
+            header=PearlHeader(
+                incomplete_header=IncompleteBlockHeader(
+                    version=self.header.version,
+                    prev_block=self.header.previous_block_hash,
+                    merkle_root=merkle_root,
+                    timestamp=self.header.timestamp,
+                    nbits=self.header.target_bits,
+                ),
+            ),
+            height=self.height,
+            # Regular transactions are immutable template data and are shared by every
+            # worker variant; only the coinbase and merkle root vary.
+            raw_transactions=self.raw_transactions,
+            coinbase_tx=coinbase_tx,
+            required_cert_version=self.required_cert_version,
+            coinbase_value=self.coinbase_value,
+            source_data=self.source_data,
+            mining_address=self.mining_address,
+            worker_id=worker_id,
         )
 
     def get_raw_transactions(self) -> list[bytes]:
@@ -100,6 +155,53 @@ class BlockTemplate:
         # Safe to use to_bytes() here: the coinbase is constructed by us.
         coinbase_bytes = self.coinbase_tx.to_bytes(self.coinbase_tx.has_segwit)
         return [coinbase_bytes] + self.raw_transactions
+
+    def get_worker_derivation_recipe(self) -> tuple[bytes, int, bytes]:
+        """Return the bounded worker-coinbase derivation recipe.
+
+        The first item is the worker-0 coinbase serialized without the SegWit
+        marker, flag, and witness.  The second item is the absolute byte offset
+        of the one-byte worker namespace inside that serialization.  The last
+        item concatenates 32-byte internal little-endian Merkle siblings from
+        the coinbase upward; every fold is ``double_sha256(left + sibling)``.
+        """
+        base_template = self if self.worker_id == 0 else self.for_worker_id(0)
+        if base_template.source_data is None:
+            raise ValueError("worker recipe requires a live getblocktemplate source")
+        header_bytes = base_template.header.serialize_without_proof_commitment()
+        if len(header_bytes) != INCOMPLETE_HEADER_BYTES:
+            raise ValueError(
+                "incomplete block header must be exactly "
+                f"{INCOMPLETE_HEADER_BYTES} bytes"
+            )
+
+        coinbase_bytes = base_template.coinbase_tx.to_bytes(False)
+        if not 0 < len(coinbase_bytes) <= MAX_WORKER_COINBASE_BYTES:
+            raise ValueError("worker coinbase serialization is outside its bounded size")
+
+        # Comparing the two endpoint worker values validates that exactly one
+        # serialized byte is mutable, including when the transaction is SegWit.
+        worker_255_bytes = base_template.for_worker_id(255).coinbase_tx.to_bytes(False)
+        if len(worker_255_bytes) != len(coinbase_bytes):
+            raise ValueError("worker coinbase serialization length changed")
+        differing_offsets = [
+            index
+            for index, (base_byte, worker_byte) in enumerate(
+                zip(coinbase_bytes, worker_255_bytes, strict=True)
+            )
+            if base_byte != worker_byte
+        ]
+        if len(differing_offsets) != 1 or coinbase_bytes[differing_offsets[0]] != 0:
+            raise ValueError("worker coinbase must differ at exactly one byte")
+        worker_offset = differing_offsets[0]
+
+        regular_txids = [tx.txid for tx in base_template.source_data.transactions]
+        merkle_branch = calculate_merkle_branch(
+            [base_template.coinbase_tx.get_txid(), *regular_txids]
+        )
+        if len(merkle_branch) > MAX_WORKER_MERKLE_BRANCH_BYTES:
+            raise ValueError("worker Merkle branch is outside its bounded size")
+        return coinbase_bytes, worker_offset, merkle_branch
 
     @property
     def bits(self) -> int:
@@ -139,7 +241,7 @@ class MoEBlockInfo:
     top_k: int
     inner_a_rows: list[int]
     inner_b_cols: list[int]
-    routing_data: torch.Tensor  # (m*top_k,) int32, expert-sorted token indices
+    routing_data: Any  # (m*top_k,) int32, expert-sorted token indices
     expert_routing_offsets: list[int]  # routing exclusive end offsets as per ZK verifier
 
 
@@ -147,8 +249,8 @@ class MoEBlockInfo:
 class OpenedBlockInfo:
     A_row_indices: list[int]
     B_column_indices: list[int]
-    A: torch.Tensor | None  # Non-noised matrix A, for PlainProof creation
-    B_t: torch.Tensor | None  # Non-noised matrix B transposed, for PlainProof creation
+    A: Any | None  # Non-noised matrix A, for PlainProof creation
+    B_t: Any | None  # Non-noised matrix B transposed, for PlainProof creation
     commitment_hash: CommitmentHash | None
     noise_rank: int
     moe: MoEBlockInfo | None = None
@@ -181,32 +283,88 @@ class MiningJob:
     target: int
     # Certificate version required for this block.
     cert_version: CertificateVersion
+    expected_reward: int | None = None
+    worker_id: int | None = None
+    worker_coinbase_bytes: bytes | None = field(default=None, repr=False, compare=False)
+    worker_coinbase_offset: int | None = field(default=None, repr=False, compare=False)
+    worker_merkle_branch: bytes | None = field(default=None, repr=False, compare=False)
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, *, include_worker_recipe: bool = False) -> dict[str, Any]:
         """Convert to dictionary for JSON-RPC response."""
-        return {
+        result = {
             "incomplete_header_bytes": b64_encode(self.incomplete_header_bytes),
             "target": self.target,
+            "target_decimal": str(self.target),
             "cert_version": int(self.cert_version),
         }
+        if self.expected_reward is not None:
+            result["expected_reward"] = self.expected_reward
+        if self.worker_id is not None:
+            result["worker_id"] = self.worker_id
+        if include_worker_recipe and self.worker_coinbase_bytes is not None:
+            if self.worker_coinbase_offset is None or self.worker_merkle_branch is None:
+                raise ValueError("worker coinbase recipe is incomplete")
+            result.update(
+                {
+                    "worker_coinbase_bytes": b64_encode(self.worker_coinbase_bytes),
+                    "worker_coinbase_offset": self.worker_coinbase_offset,
+                    "worker_merkle_branch": b64_encode(self.worker_merkle_branch),
+                }
+            )
+        return result
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MiningJob":
         """Create MiningJob from dictionary (JSON-RPC deserialization)."""
 
+        target_value = data.get("target_decimal", data["target"])
+        if isinstance(target_value, bool):
+            raise ValueError("target must be a positive uint256")
+        target = int(target_value)
+        if target <= 0 or target > UINT256_MAX:
+            raise ValueError("target must be a positive uint256")
+
+        worker_id = data.get("worker_id")
+        if (
+            worker_id is not None
+            and (
+                isinstance(worker_id, bool)
+                or not isinstance(worker_id, int)
+                or not 0 <= worker_id <= 0xFF
+            )
+        ):
+            raise ValueError("worker_id must be an integer from 0 to 255")
+
+        incomplete_header_bytes = b64_decode(data["incomplete_header_bytes"])
+        if len(incomplete_header_bytes) != INCOMPLETE_HEADER_BYTES:
+            raise ValueError(
+                "incomplete block header must be exactly "
+                f"{INCOMPLETE_HEADER_BYTES} bytes"
+            )
+
         return cls(
-            incomplete_header_bytes=b64_decode(data["incomplete_header_bytes"]),
-            target=data["target"],
+            incomplete_header_bytes=incomplete_header_bytes,
+            target=target,
             cert_version=CertificateVersion(data["cert_version"]),
+            expected_reward=data.get("expected_reward"),
+            worker_id=worker_id,
         )
 
     @classmethod
-    def from_template(cls, template: BlockTemplate) -> "MiningJob":
+    def from_template(
+        cls, template: BlockTemplate, *, include_worker_recipe: bool = False
+    ) -> "MiningJob":
         """Create MiningJob from BlockTemplate."""
+        worker_recipe = template.get_worker_derivation_recipe() if include_worker_recipe else None
         return cls(
             incomplete_header_bytes=template.header.serialize_without_proof_commitment(),
             target=template.target,
             cert_version=template.required_cert_version,
+            expected_reward=template.coinbase_value,
+            worker_id=template.worker_id,
+            worker_coinbase_bytes=worker_recipe[0] if worker_recipe else None,
+            worker_coinbase_offset=worker_recipe[1] if worker_recipe else None,
+            worker_merkle_branch=worker_recipe[2] if worker_recipe else None,
         )
 
     def adjust_target(self, mining_config: MiningConfiguration) -> int:
