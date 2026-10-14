@@ -599,6 +599,9 @@ impl PlainProof {
             moe: moe_params,
         };
 
+        // Reject malformed public parameters before compile performs rank-dependent
+        // arithmetic or constructs the proof layout.
+        public.sanity_check()?;
         let (compiled, msg_locs, cv_locs) = public.compile();
         let strip_len = public.dot_product_length();
 
@@ -714,6 +717,39 @@ mod tests {
             a: dummy_matrix_proof(),
             bt: dummy_matrix_proof(),
             moe: None,
+        }
+    }
+
+    /// A structurally valid dense proof whose empty Merkle payloads are enough
+    /// to exercise public-parameter validation before witness extraction.
+    fn parseable_dense_proof(noise_rank: usize, k: usize) -> PlainProof {
+        let m = 256;
+        let n = 128;
+        let mut a = dummy_matrix_proof();
+        a.row_indices = vec![0, 1, 2, 3, 8, 9, 10, 11];
+        a.proof.total_leaves = PlainProof::expected_merkle_leaves(&[m, k]).unwrap();
+        let mut bt = dummy_matrix_proof();
+        bt.row_indices = vec![0, 1, 8, 9];
+        bt.proof.total_leaves = PlainProof::expected_merkle_leaves(&[n, k]).unwrap();
+
+        PlainProof {
+            m,
+            n,
+            k,
+            noise_rank,
+            a,
+            bt,
+            moe: None,
+        }
+    }
+
+    fn test_header() -> IncompleteBlockHeader {
+        IncompleteBlockHeader {
+            version: 3,
+            prev_block: [0; 32],
+            merkle_root: [0; 32],
+            timestamp: 0,
+            nbits: 0,
         }
     }
 
@@ -844,5 +880,29 @@ mod tests {
 
         proof.moe.as_mut().unwrap().routing_proof.total_leaves = 3;
         assert!(proof.check_declared_tree_sizes().is_err());
+    }
+
+    #[test]
+    fn parse_proof_rejects_zero_rank_before_compilation_for_both_seed_derivations() {
+        for seed_derivation in [SeedDerivation::Legacy, SeedDerivation::Salted] {
+            let error = parseable_dense_proof(0, 1024)
+                .parse_proof(test_header(), seed_derivation)
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("Rank must"),
+                "unexpected error for {seed_derivation:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_proof_rejects_invalid_common_dim_before_compilation() {
+        let error = parseable_dense_proof(32, 64)
+            .parse_proof(test_header(), SeedDerivation::Legacy)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("k must be >= 16r"),
+            "unexpected error: {error}"
+        );
     }
 }
